@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from lfx.services.settings.service import SettingsService
+    from pydantic import SecretStr
     from sqlmodel.ext.asyncio.session import AsyncSession
 
 
@@ -198,7 +199,7 @@ class DatabaseVariableService(VariableService, Service):
         name: str,
         field: str,
         session: AsyncSession,
-    ) -> str:
+    ) -> str | SecretStr:
         # we get the credential from the database
         # credential = session.query(Variable).filter(Variable.user_id == user_id, Variable.name == name).first()
         variable = await self.get_variable_object(user_id, name, session)
@@ -210,9 +211,23 @@ class DatabaseVariableService(VariableService, Service):
             )
             raise TypeError(msg)
 
-        # Only decrypt CREDENTIAL type variables; GENERIC variables are stored as plain text
+        # Only decrypt CREDENTIAL type variables; GENERIC variables are stored as plain text.
+        # CREDENTIAL values are wrapped in pydantic.SecretStr so that any consumer that echoes
+        # the value through a stringification path (Message.text, status, traces, logs) gets
+        # "**********" instead of the raw secret. Consumers that genuinely need the raw value
+        # call .get_secret_value() at the boundary (e.g. provider client construction).
         if variable.type == CREDENTIAL_TYPE:
-            return auth_utils.decrypt_api_key(variable.value)
+            from pydantic import SecretStr
+
+            decrypted = auth_utils.decrypt_api_key(variable.value)
+            if not decrypted:
+                msg = (
+                    f"Could not decrypt credential variable '{name}'. The stored value cannot be "
+                    "decrypted with the current LANGFLOW_SECRET_KEY — it may have been encrypted "
+                    "with a different key."
+                )
+                raise ValueError(msg)
+            return SecretStr(decrypted)
         # GENERIC type - return as-is
         return variable.value
 
@@ -223,9 +238,26 @@ class DatabaseVariableService(VariableService, Service):
         for variable in variables:
             value = None
             if variable.type == GENERIC_TYPE:
+                if not variable.value:
+                    await logger.awarning("Variable '%s' has no stored value — skipping.", variable.name)
+                    continue
+                # Security defense-in-depth: a GENERIC variable is stored as plain text, so its
+                # value must never be a Fernet token. If it is (e.g. a CREDENTIAL row that was
+                # relabeled GENERIC), do NOT decrypt-and-return it — that would leak the secret.
+                if isinstance(variable.value, str) and variable.value.startswith("gAAAAA"):
+                    await logger.awarning(
+                        "Skipping variable '%s': a GENERIC variable holds ciphertext "
+                        "(likely a CREDENTIAL row relabeled GENERIC); not decrypting or returning it.",
+                        variable.name,
+                    )
+                    continue
                 value = auth_utils.decrypt_api_key(variable.value)
                 if not value:
-                    # If decryption fails (likely due to encryption by different key), skip this variable
+                    await logger.awarning(
+                        "Variable '%s' could not be decrypted — likely encrypted with a different "
+                        "LANGFLOW_SECRET_KEY. Skipping.",
+                        variable.name,
+                    )
                     continue
 
             # Model validate will set value to None if credential type
@@ -330,7 +362,21 @@ class DatabaseVariableService(VariableService, Service):
     ):
         query = select(Variable).where(Variable.id == variable_id, Variable.user_id == user_id)
         db_variable = (await session.exec(query)).one()
-        db_variable.updated_at = datetime.now(timezone.utc)
+
+        # Security: prevent a CREDENTIAL -> GENERIC type-confusion that would expose the
+        # decrypted secret. Credential values are stored as Fernet ciphertext ("gAAAAA...").
+        # Relabeling the row GENERIC *without* supplying a fresh value would leave that
+        # ciphertext in place; get_all() then decrypts GENERIC values and returns the
+        # plaintext (e.g. the server's shared provider keys). Reject that transition.
+        resulting_type = variable.type if variable.type is not None else db_variable.type
+        if (
+            resulting_type == GENERIC_TYPE
+            and variable.value is None
+            and isinstance(db_variable.value, str)
+            and db_variable.value.startswith("gAAAAA")
+        ):
+            msg = "Cannot change a credential variable to a generic variable without providing a new value."
+            raise ValueError(msg)
 
         # Handle value encryption based on variable type (consistent with update_variable and create_variable)
         if variable.value is not None:
@@ -349,6 +395,7 @@ class DatabaseVariableService(VariableService, Service):
                 variable.value = auth_utils.encrypt_api_key(variable.value, settings_service=self.settings_service)
             # GENERIC_TYPE variables are stored as plain text
 
+        db_variable.updated_at = datetime.now(timezone.utc)
         variable_data = variable.model_dump(exclude_unset=True)
         for key, value in variable_data.items():
             setattr(db_variable, key, value)

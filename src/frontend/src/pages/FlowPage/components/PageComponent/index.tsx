@@ -18,14 +18,16 @@ import {
   useState,
 } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
+import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import ForwardedIconComponent from "@/components/common/genericIconComponent";
+import { FlowBuilderWelcomeMount } from "@/components/core/flowBuilderWelcome/flow-builder-welcome-mount";
 import FlowToolbar from "@/components/core/flowToolbarComponent";
 import {
-  COLOR_OPTIONS,
   NOTE_NODE_MIN_HEIGHT,
   NOTE_NODE_MIN_WIDTH,
 } from "@/constants/constants";
+import { useIsFlowReadOnly } from "@/contexts/permissionsContext";
 import { api } from "@/controllers/API/api";
 import { getURL } from "@/controllers/API/helpers/constants";
 import { useGetBuildsQuery } from "@/controllers/API/queries/_builds";
@@ -33,14 +35,14 @@ import CustomLoader from "@/customization/components/custom-loader";
 import { track } from "@/customization/utils/analytics";
 import useApplyFlowToCanvas from "@/hooks/flows/use-apply-flow-to-canvas";
 import useAutoSaveFlow from "@/hooks/flows/use-autosave-flow";
-
 import { useFlowEvents } from "@/hooks/flows/use-flow-events";
 import useUploadFlow from "@/hooks/flows/use-upload-flow";
 import { useAddComponent } from "@/hooks/use-add-component";
 import InspectionPanel from "@/pages/FlowPage/components/InspectionPanel";
+import useAssistantManagerStore from "@/stores/assistantManagerStore";
+import useFlowBuilderWelcomeStore from "@/stores/flowBuilderWelcomeStore";
 import { nodeColorsName } from "@/utils/styleUtils";
 import { isSupportedNodeTypes } from "@/utils/utils";
-import { useTranslation } from "react-i18next";
 import ExportModal from "../../../../modals/exportModal";
 import useAlertStore from "../../../../stores/alertStore";
 import useFlowStore from "../../../../stores/flowStore";
@@ -77,11 +79,13 @@ import {
   getSnapPosition,
   type HelperLinesState,
 } from "./helpers/helper-lines";
+import { useCanvasDragSelectFix } from "./hooks/useCanvasDragSelectFix";
 import {
   MemoizedBackground,
   MemoizedCanvasControls,
   MemoizedSidebarTrigger,
 } from "./MemoizedComponents";
+import { computeNoteScreenPosition } from "./utils/compute-note-position";
 import getRandomName from "./utils/get-random-name";
 import isWrappedWithClass from "./utils/is-wrapped-with-class";
 
@@ -114,6 +118,7 @@ export default function Page({
 
   const previewLabel = useVersionPreviewStore((s) => s.previewLabel);
   const isPreviewActive = previewLabel !== null;
+  const isWelcomeOpen = useFlowBuilderWelcomeStore((state) => state.isOpen);
   const onNodesChange = useFlowStore((state) => state.onNodesChange);
   const onEdgesChange = useFlowStore((state) => state.onEdgesChange);
   const setNodes = useFlowStore((state) => state.setNodes);
@@ -143,16 +148,22 @@ export default function Page({
   const isLocked = useFlowStore(
     useShallow((state) => state.currentFlow?.locked),
   );
+  const currentFlowResourceId = useFlowStore((state) => state.currentFlow?.id);
 
   const position = useRef({ x: 0, y: 0 });
   const [lastSelection, setLastSelection] =
     useState<OnSelectionChangeParams | null>(null);
   const currentFlowId = useFlowsManagerStore((state) => state.currentFlowId);
+  const isPermissionReadOnly = useIsFlowReadOnly(currentFlowResourceId);
 
   const { isAgentWorking, events, lastSettledAt, clearEvents } = useFlowEvents(
     currentFlowId || undefined,
   );
-  const effectiveLocked = isLocked || isAgentWorking;
+  const isAssistantProcessing = useAssistantManagerStore(
+    (state) => state.isAssistantProcessing,
+  );
+  const effectiveLocked =
+    isLocked || isPermissionReadOnly || isAgentWorking || isAssistantProcessing;
 
   // Keep banner mounted during exit animation, preserve last text
   const [bannerVisible, setBannerVisible] = useState(false);
@@ -290,16 +301,10 @@ export default function Page({
     }
   }, [currentFlowId]);
 
-  const [isAddingNote, setIsAddingNote] = useState(false);
-
   const addComponent = useAddComponent();
 
-  const zoomLevel = reactFlowInstance?.getZoom();
-  const shadowBoxWidth = NOTE_NODE_MIN_WIDTH * (zoomLevel || 1);
-  const shadowBoxHeight = NOTE_NODE_MIN_HEIGHT * (zoomLevel || 1);
-  const shadowBoxBackgroundColor = COLOR_OPTIONS[Object.keys(COLOR_OPTIONS)[0]];
-
   const handleGroupNode = useCallback(() => {
+    if (effectiveLocked) return;
     takeSnapshot();
     const edgesState = useFlowStore.getState().edges;
     if (validateSelection(lastSelection!, edgesState).length === 0) {
@@ -331,7 +336,7 @@ export default function Page({
         list: validateSelection(lastSelection!, edgesState),
       });
     }
-  }, [lastSelection, setNodes, setErrorData, takeSnapshot]);
+  }, [effectiveLocked, lastSelection, setNodes, setErrorData, takeSnapshot, t]);
 
   useEffect(() => {
     const handleMouseMove = (event) => {
@@ -524,11 +529,12 @@ export default function Page({
 
   const onConnectMod = useCallback(
     (params: Connection) => {
+      if (effectiveLocked) return;
       takeSnapshot();
       onConnect(params);
       track("New Component Connection Added");
     },
-    [takeSnapshot, onConnect],
+    [effectiveLocked, takeSnapshot, onConnect],
   );
 
   const [helperLines, setHelperLines] = useState<HelperLinesState>({});
@@ -729,6 +735,8 @@ export default function Page({
     setSelectionEnded(false);
   }, []);
 
+  useCanvasDragSelectFix(reactFlowWrapper);
+
   // Workaround to show the menu only after the selection has ended.
   useEffect(() => {
     if (selectionEnded && lastSelection && lastSelection.nodes.length > 1) {
@@ -767,58 +775,11 @@ export default function Page({
     [effectiveLocked, setRightClickedNodeId, setNodes],
   );
 
-  const onPaneClick = useCallback(
-    (event: React.MouseEvent) => {
-      setFilterEdge([]);
-      setFilterComponent("");
-      // Hide right-click dropdown when clicking on the pane
-      setRightClickedNodeId(null);
-      if (isAddingNote) {
-        const shadowBox = document.getElementById("shadow-box");
-        if (shadowBox) {
-          shadowBox.style.display = "none";
-        }
-        const position = reactFlowInstance?.screenToFlowPosition({
-          x: event.clientX - shadowBoxWidth / 2,
-          y: event.clientY - shadowBoxHeight / 2,
-        });
-        const data = {
-          node: {
-            description: "",
-            display_name: "",
-            documentation: "",
-            template: {},
-          },
-          type: "note",
-        };
-        const newId = getNodeId(data.type);
-
-        const newNode: NoteNodeType = {
-          id: newId,
-          type: "noteNode",
-          position: position || { x: 0, y: 0 },
-          width: NOTE_NODE_MIN_WIDTH,
-          height: NOTE_NODE_MIN_HEIGHT,
-          data: {
-            ...data,
-            id: newId,
-          },
-        };
-        setNodes((nds) => nds.concat(newNode));
-        setIsAddingNote(false);
-        // Signal sidebar to revert add_note active state
-        window.dispatchEvent(new Event("lf:end-add-note"));
-      }
-    },
-    [
-      isAddingNote,
-      setNodes,
-      reactFlowInstance,
-      getNodeId,
-      setFilterEdge,
-      setFilterComponent,
-    ],
-  );
+  const onPaneClick = useCallback(() => {
+    setFilterEdge([]);
+    setFilterComponent("");
+    setRightClickedNodeId(null);
+  }, [setFilterEdge, setFilterComponent, setRightClickedNodeId]);
 
   const handleEdgeClick = (event, edge) => {
     if (effectiveLocked) {
@@ -840,42 +801,52 @@ export default function Page({
     }
   };
 
-  useEffect(() => {
-    const handleGlobalMouseMove = (event) => {
-      if (isAddingNote) {
-        const shadowBox = document.getElementById("shadow-box");
-        if (shadowBox) {
-          shadowBox.style.display = "block";
-          shadowBox.style.left = `${event.clientX - shadowBoxWidth / 2}px`;
-          shadowBox.style.top = `${event.clientY - shadowBoxHeight / 2}px`;
-        }
-      }
-    };
-
-    document.addEventListener("mousemove", handleGlobalMouseMove);
-
-    return () => {
-      document.removeEventListener("mousemove", handleGlobalMouseMove);
-    };
-  }, [isAddingNote, shadowBoxWidth, shadowBoxHeight]);
-
-  // Listen for a global event to start the add-note flow from outside components
+  // Listen for a global event to start the add-note flow from outside components.
+  // Immediately places the note above the toolbar so the user can drag it right away.
   useEffect(() => {
     const handleStartAddNote = () => {
-      setIsAddingNote(true);
-      const shadowBox = document.getElementById("shadow-box");
-      if (shadowBox) {
-        shadowBox.style.display = "block";
-        shadowBox.style.left = `${position.current.x - shadowBoxWidth / 2}px`;
-        shadowBox.style.top = `${position.current.y - shadowBoxHeight / 2}px`;
+      if (effectiveLocked) {
+        window.dispatchEvent(new Event("lf:end-add-note"));
+        return;
       }
+      const toolbar = document.querySelector(
+        "[data-testid='main_canvas_controls']",
+      );
+      const screenPos = computeNoteScreenPosition(
+        toolbar?.getBoundingClientRect(),
+      );
+      const notePosition = reactFlowInstance?.screenToFlowPosition(screenPos);
+
+      const data = {
+        node: {
+          description: "",
+          display_name: "",
+          documentation: "",
+          template: {},
+        },
+        type: "note",
+      };
+      const newId = getNodeId(data.type);
+
+      const newNode: NoteNodeType = {
+        id: newId,
+        type: "noteNode",
+        position: notePosition ?? { x: 0, y: 0 },
+        width: NOTE_NODE_MIN_WIDTH,
+        height: NOTE_NODE_MIN_HEIGHT,
+        selected: false,
+        data: { ...data, id: newId },
+      };
+
+      setNodes((nds) => nds.concat(newNode));
+      window.dispatchEvent(new Event("lf:end-add-note"));
     };
 
     window.addEventListener("lf:start-add-note", handleStartAddNote);
     return () => {
       window.removeEventListener("lf:start-add-note", handleStartAddNote);
     };
-  }, [shadowBoxWidth, shadowBoxHeight]);
+  }, [effectiveLocked, reactFlowInstance, getNodeId, setNodes]);
 
   const MIN_ZOOM = 0.25;
   const MAX_ZOOM = 2;
@@ -926,25 +897,23 @@ export default function Page({
       {showCanvas ? (
         <>
           <div id="react-flow-id" className="h-full w-full bg-canvas relative">
-            {!view && (
+            {!isWelcomeOpen && <MemoizedSidebarTrigger />}
+            {!view && !isWelcomeOpen && (
               <>
                 <MemoizedCanvasControls
                   selectedNode={selectedNode}
-                  setIsAddingNote={setIsAddingNote}
-                  shadowBoxWidth={shadowBoxWidth}
-                  shadowBoxHeight={shadowBoxHeight}
                   isAgentWorking={isAgentWorking}
+                  isReadOnly={effectiveLocked}
                 />
                 {!isPreviewActive && <FlowToolbar />}
-                {inspectionPanelVisible && (
+                {inspectionPanelVisible && !effectiveLocked && (
                   <InspectionPanel selectedNode={selectedNode} />
                 )}
               </>
             )}
-            <MemoizedSidebarTrigger />
             <SelectionMenu
               lastSelection={lastSelection}
-              isVisible={selectionMenuVisible}
+              isVisible={selectionMenuVisible && !effectiveLocked}
               nodes={lastSelection?.nodes}
               onClick={handleGroupNode}
             />
@@ -975,20 +944,36 @@ export default function Page({
               onReconnectEnd={
                 effectiveLocked || isPreviewActive ? undefined : onEdgeUpdateEnd
               }
-              onNodeDrag={isPreviewActive ? undefined : onNodeDrag}
-              onNodeDragStart={isPreviewActive ? undefined : onNodeDragStart}
+              onNodeDrag={
+                isPreviewActive || effectiveLocked ? undefined : onNodeDrag
+              }
+              onNodeDragStart={
+                isPreviewActive || effectiveLocked ? undefined : onNodeDragStart
+              }
               onSelectionDragStart={
-                isPreviewActive ? undefined : onSelectionDragStart
+                isPreviewActive || effectiveLocked
+                  ? undefined
+                  : onSelectionDragStart
               }
               elevateEdgesOnSelect={false}
-              onSelectionEnd={isPreviewActive ? undefined : onSelectionEnd}
-              onSelectionStart={isPreviewActive ? undefined : onSelectionStart}
+              onSelectionEnd={
+                isPreviewActive || effectiveLocked ? undefined : onSelectionEnd
+              }
+              onSelectionStart={
+                isPreviewActive || effectiveLocked
+                  ? undefined
+                  : onSelectionStart
+              }
               connectionRadius={30}
               edgeTypes={edgeTypes}
               connectionLineComponent={ConnectionLineComponent}
-              onDragOver={isPreviewActive ? undefined : onDragOver}
-              onNodeDragStop={isPreviewActive ? undefined : onNodeDragStop}
-              onDrop={isPreviewActive ? undefined : onDrop}
+              onDragOver={
+                isPreviewActive || effectiveLocked ? undefined : onDragOver
+              }
+              onNodeDragStop={
+                isPreviewActive || effectiveLocked ? undefined : onNodeDragStop
+              }
+              onDrop={isPreviewActive || effectiveLocked ? undefined : onDrop}
               onSelectionChange={onSelectionChange}
               deleteKeyCode={[]}
               fitView={isEmptyFlow.current ? false : true}
@@ -1008,7 +993,7 @@ export default function Page({
               onKeyDown={handleKeyDown}
               onNodeContextMenu={onNodeContextMenu}
             >
-              <UpdateAllComponents />
+              {!effectiveLocked && <UpdateAllComponents />}
               <MemoizedBackground />
               {helperLineEnabled && <HelperLines helperLines={helperLines} />}
             </ReactFlow>
@@ -1034,25 +1019,16 @@ export default function Page({
               </div>
             )}
             {isPreviewActive && <VersionPreviewOverlay />}
+            {/* Welcome overlay surfaces on freshly-created empty flows —
+                its visibility is driven entirely by the
+                ``flowBuilderWelcomeStore`` which is primed by the
+                "New Flow" button on the home page. */}
+            {!effectiveLocked && <FlowBuilderWelcomeMount />}
           </div>
-          <div
-            id="shadow-box"
-            style={{
-              position: "absolute",
-              width: `${shadowBoxWidth}px`,
-              height: `${shadowBoxHeight}px`,
-              backgroundColor: `${shadowBoxBackgroundColor}`,
-              opacity: 0.7,
-              pointerEvents: "none",
-              borderRadius: "12px",
-              // Prevent shadow-box from showing unexpectedly during initial renders
-              display: "none",
-            }}
-          ></div>
         </>
       ) : (
         <div className="flex h-full w-full items-center justify-center">
-          <CustomLoader remSize={30} />
+          <CustomLoader remSize={20} />
         </div>
       )}
       <ExportModal open={openExportModal} setOpen={setOpenExportModal} />

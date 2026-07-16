@@ -20,6 +20,7 @@ from ag_ui.core import RunFinishedEvent, RunStartedEvent
 
 from lfx.exceptions.component import ComponentBuildError
 from lfx.graph.edge.base import CycleEdge, Edge
+from lfx.graph.exceptions import GraphPausedException
 from lfx.graph.graph.constants import Finish, lazy_load_vertex_dict
 from lfx.graph.graph.runnable_vertices_manager import RunnableVerticesManager
 from lfx.graph.graph.schema import GraphData, GraphDump, StartConfigDict, VertexBuildResult
@@ -44,12 +45,19 @@ from lfx.services.cache.utils import CacheMiss
 from lfx.services.deps import get_chat_service, get_tracing_service
 from lfx.utils.async_helpers import run_until_complete
 
+INPUT_TYPE_COMPONENT_TYPES = {
+    "chat": {InterfaceComponentTypes.ChatInput.value},
+    "text": {InterfaceComponentTypes.TextInput.value},
+}
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Generator, Iterable
     from typing import Any
 
     from lfx.custom.custom_component.component import Component
     from lfx.events.event_manager import EventManager
+    from lfx.graph.checkpoint.schema import GraphCheckpoint
+    from lfx.graph.checkpoint.store import CheckpointStore
     from lfx.graph.edge.schema import EdgeData
     from lfx.graph.schema import ResultData
     from lfx.schema.schema import InputValueRequest
@@ -91,6 +99,11 @@ class Graph:
         self.flow_name = flow_name
         self.description = description
         self.user_id = user_id
+        # Optional caller-supplied label forwarded to tracing providers. Kept
+        # distinct from ``self.user_id`` so request-supplied identifiers can be
+        # surfaced in external traces (e.g. Langfuse trace metadata) without
+        # leaking into authn/authz paths.
+        self.tracing_user_id: str | None = None
         self._is_input_vertices: list[str] = []
         self._is_output_vertices: list[str] = []
         self._is_state_vertices: list[str] | None = None
@@ -131,6 +144,20 @@ class Graph:
         self._snapshots: list[dict[str, Any]] = []
         self._end_trace_tasks: set[asyncio.Task] = set()
         self._is_subgraph = False
+        self.checkpointing_enabled = False
+        self.pause_requested = False
+        self.pause_info: dict[str, Any] | None = None
+        self.checkpoint_store: CheckpointStore | None = None
+        self.job_id: str | None = None
+        self.resumed_from_checkpoint = False
+        # Vertices already built at checkpoint time: on resume their async generators are exhausted,
+        # so the output-collection loop must NOT re-consume them. Empty for fresh (non-resume) runs.
+        self.checkpoint_restored_built_ids: set[str] = set()
+        # Built vertices whose live output (Tool/model client) was opaque-dropped to None in the
+        # checkpoint: only these re-run on resume to regenerate the object, so producers whose output
+        # round-tripped (e.g. an Agent's Message) are not needlessly re-executed. Empty otherwise.
+        self.checkpoint_opaque_dropped_ids: set[str] = set()
+        self.pause_probe: Callable[[str], Any] | None = None
 
         if context and not isinstance(context, dict):
             msg = "Context must be a dictionary"
@@ -262,12 +289,16 @@ class Graph:
         for vertex in self._vertices:
             if vertex_id := vertex.get("id"):
                 self.top_level_vertices.append(vertex_id)
-            if vertex_id in self.cycle_vertices:
-                self.run_manager.add_to_cycle_vertices(vertex_id)
+
+        self._cycle_vertices = None
+        self._is_cyclic = None
         self._graph_data = process_flow(self.raw_graph_data)
 
         self._vertices = self._graph_data["nodes"]
         self._edges = self._graph_data["edges"]
+        self._cycle_vertices = None
+        self._is_cyclic = None
+        self.run_manager.cycle_vertices.clear()
         self.initialize()
 
     def add_component(self, component: Component, component_id: str | None = None) -> str:
@@ -361,6 +392,7 @@ class Graph:
         event_manager: EventManager | None = None,
         *,
         reset_output_values: bool = True,
+        fallback_to_env_vars: bool = False,
     ):
         # Preserve start_component_id from constructor if available
         start_component_id = self._start.get_id() if self._start else None
@@ -379,7 +411,9 @@ class Graph:
         yielded_counts: dict[str, int] = defaultdict(int)
 
         while should_continue(yielded_counts, max_iterations):
-            result = await self.astep(event_manager=event_manager, inputs=inputs)
+            result = await self.astep(
+                event_manager=event_manager, inputs=inputs, fallback_to_env_vars=fallback_to_env_vars
+            )
             yield result
             if isinstance(result, Finish):
                 return
@@ -661,6 +695,90 @@ class Graph:
 
         self._run_id = str(run_id)
 
+    def request_pause(self, reason: str = "pause_requested", data: dict[str, Any] | None = None) -> None:
+        self.pause_requested = True
+        self.pause_info = {"reason": reason, "data": data or {}}
+
+    @classmethod
+    def resume_from_checkpoint(cls, checkpoint: GraphCheckpoint, *, checkpoint_store: CheckpointStore | None = None):
+        from lfx.graph.checkpoint.resume import restore_graph_from_checkpoint
+
+        return restore_graph_from_checkpoint(checkpoint, store=checkpoint_store)
+
+    def resume_first_layer(self) -> list[str]:
+        from lfx.graph.checkpoint.resume import compute_resume_layer
+
+        return compute_resume_layer(self)
+
+    def build_checkpoint(self) -> GraphCheckpoint:
+        from lfx.graph.checkpoint.builder import build_checkpoint
+
+        return build_checkpoint(self)
+
+    def _persist_resolved_branch_exclusions(self) -> None:
+        """Promote already-answered HumanInput decisions into the persistent exclusion channel.
+
+        A HumanInput stops its non-chosen branches with ``self.stop()`` (transient INACTIVE: reset
+        per build and never checkpointed). When a later HumanInput pauses, the earlier node's dead
+        branches would revive on resume and run — surfacing extra outputs and a re-paused first node.
+        Move each resolved decision into ``conditionally_excluded_vertices`` (the same durable channel
+        ConditionalRouter uses) so the dead branches stay dead across the resume. Derived from graph
+        edges plus the recorded decision, so it also covers saved flows whose frozen component code
+        predates any in-component exclusion call.
+        """
+        decisions = getattr(self, "human_input_decisions", {}) or {}
+        if not decisions:
+            return
+        for vertex in self.vertices:
+            if (getattr(vertex, "data", None) or {}).get("type") != "HumanInput":
+                continue
+            decision = decisions.get(f"{vertex.id}:{self.run_id}")
+            if not decision:
+                continue
+            chosen = decision.get("action_id")
+            branch_outputs = {
+                edge.source_handle.name
+                for edge in self.edges
+                if edge.source_id == vertex.id and edge.source_handle.name.startswith("branch_")
+            }
+            non_chosen = sorted(branch_outputs - {f"branch_{chosen}"})
+            if non_chosen:
+                self.exclude_branches_conditionally(vertex.id, non_chosen)
+
+    async def _check_for_pause_signal(self) -> None:
+        if self.pause_probe is None or self.job_id is None:
+            return
+        decision = await self.pause_probe(self.job_id)
+        if decision == "pause":
+            self.request_pause()
+        elif decision == "cancel":
+            raise asyncio.CancelledError
+
+    async def check_and_handle_pause(self) -> None:
+        """Boundary hook: consult the probe and suspend if a pause is pending.
+
+        Raises GraphPausedException after persisting the checkpoint. Default-off:
+        with no probe, no pause request, or checkpointing disabled this is a no-op,
+        so existing flows are unchanged.
+        """
+        await self._check_for_pause_signal()
+        if not (self.checkpointing_enabled and self.pause_requested):
+            return
+        self._persist_resolved_branch_exclusions()
+        checkpoint = self.build_checkpoint()
+        store = self.checkpoint_store
+        if store is None:
+            from lfx.services.deps import get_checkpoint_service
+
+            store = get_checkpoint_service()
+        await store.save(checkpoint)
+        info = self.pause_info or {}
+        raise GraphPausedException(
+            checkpoint_id=checkpoint.checkpoint_id,
+            reason=info.get("reason", "pause_requested"),
+            data=info.get("data"),
+        )
+
     async def initialize_run(self) -> None:
         if not self._run_id:
             self.set_run_id()
@@ -672,6 +790,7 @@ class Graph:
                 user_id=self.user_id,
                 session_id=self.session_id,
                 flow_id=self.flow_id,
+                tracing_user_id=self.tracing_user_id,
             )
 
     def _end_all_traces_async(self, outputs: dict[str, Any] | None = None, error: Exception | None = None) -> None:
@@ -744,22 +863,24 @@ class Graph:
     def _set_inputs(self, input_components: list[str], inputs: dict[str, str], input_type: InputType | None) -> None:
         """Updates input vertices' parameters with the provided inputs, filtering by component list and input type.
 
-        Only vertices whose IDs or display names match the specified input components and whose IDs contain
+        Only vertices whose IDs or display names match the specified input components and whose component type matches
         the input type (unless input type is 'any' or None) are updated. Raises a ValueError if a specified
         vertex is not found.
         """
         for vertex_id in self._is_input_vertices:
             vertex = self.get_vertex(vertex_id)
-            # If the vertex is not in the input_components list
-            if input_components and (vertex_id not in input_components and vertex.display_name not in input_components):
-                continue
-            # If the input_type is not any and the input_type is not in the vertex id
-            # Example: input_type = "chat" and vertex.id = "OpenAI-19ddn"
-            if input_type is not None and input_type != "any" and input_type not in vertex.id.lower():
-                continue
             if vertex is None:
                 msg = f"Vertex {vertex_id} not found"
                 raise ValueError(msg)
+            # If the vertex is not in the input_components list
+            if input_components and (vertex_id not in input_components and vertex.display_name not in input_components):
+                continue
+            if (
+                input_type is not None
+                and input_type != "any"
+                and vertex.data.get("type") not in INPUT_TYPE_COMPONENT_TYPES.get(input_type, set())
+            ):
+                continue
             vertex.update_raw_params(inputs, overwrite=True)
 
     async def _run(
@@ -824,6 +945,10 @@ class Graph:
                 event_manager=event_manager,
             )
             self.increment_run_count()
+        except (GraphPausedException, asyncio.CancelledError):
+            # Why: a HITL pause/cancel must propagate UNWRAPPED so the job/runner layer suspends the
+            # run instead of finalizing it; wrapping it as ValueError terminalizes the job (LE-1440).
+            raise
         except Exception as exc:
             self._end_all_traces_async(error=exc)
             msg = f"Error running graph: {exc}"
@@ -839,7 +964,14 @@ class Graph:
                 msg = f"Vertex {vertex_id} not found"
                 raise ValueError(msg)
 
-            if not vertex.result and not stream and hasattr(vertex, "consume_async_generator"):
+            if (
+                not vertex.result
+                and not stream
+                and vertex.id not in self.checkpoint_restored_built_ids
+                and hasattr(vertex, "consume_async_generator")
+            ):
+                # A vertex restored from a checkpoint already consumed its generator in the original
+                # run; re-consuming here would re-iterate an exhausted/absent iterator and raise.
                 await vertex.consume_async_generator()
             if (not outputs and vertex.is_output) or (vertex.display_name in outputs or vertex.id in outputs):
                 vertex_outputs.append(vertex.result)
@@ -858,25 +990,34 @@ class Graph:
         fallback_to_env_vars: bool = False,
         event_manager: EventManager | None = None,
     ) -> list[RunOutputs]:
-        """Runs the graph with the given inputs.
+        """Runs the graph with the given inputs via the configured executor."""
+        from lfx.execution import get_default_coordinator
 
-        Args:
-            inputs (list[Dict[str, str]]): The input values for the graph.
-            inputs_components (Optional[list[list[str]]], optional): Components to run for the inputs. Defaults to None.
-            types (Optional[list[Optional[InputType]]], optional): The types of the inputs. Defaults to None.
-            outputs (Optional[list[str]], optional): The outputs to retrieve from the graph. Defaults to None.
-            session_id (Optional[str], optional): The session ID for the graph. Defaults to None.
-            stream (bool, optional): Whether to stream the results or not. Defaults to False.
-            fallback_to_env_vars (bool, optional): Whether to fallback to environment variables. Defaults to False.
-            event_manager (EventManager | None): The event manager for the graph.
+        return await get_default_coordinator().run_to_completion(
+            self,
+            inputs=inputs,
+            inputs_components=inputs_components,
+            types=types,
+            outputs=outputs,
+            session_id=session_id,
+            stream=stream,
+            fallback_to_env_vars=fallback_to_env_vars,
+            event_manager=event_manager,
+            _use_arun_legacy=True,
+        )
 
-        Returns:
-            List[RunOutputs]: The outputs of the graph.
-        """
-        # inputs is {"message": "Hello, world!"}
-        # we need to go through self.inputs and update the self.raw_params
-        # of the vertices that are inputs
-        # if the value is a list, we need to run multiple times
+    async def _arun_legacy(
+        self,
+        inputs: list[dict[str, str]],
+        *,
+        inputs_components: list[list[str]] | None = None,
+        types: list[InputType | None] | None = None,
+        outputs: list[str] | None = None,
+        session_id: str | None = None,
+        stream: bool = False,
+        fallback_to_env_vars: bool = False,
+        event_manager: EventManager | None = None,
+    ) -> list[RunOutputs]:
         vertex_outputs = []
         if not isinstance(inputs, list):
             inputs = [inputs]
@@ -966,13 +1107,52 @@ class Graph:
         if state == VertexStates.INACTIVE:
             self.run_manager.remove_from_predecessors(vertex_id)
 
+    def _get_output_names(self, vertex_id: str) -> set[str]:
+        return {
+            edge.source_handle.name
+            for edge in self.edges
+            if edge.source_id == vertex_id and getattr(edge.source_handle, "name", None)
+        }
+
+    def _collect_branch_vertices(self, vertex_id: str, output_names: set[str] | None = None) -> set[str]:
+        visited: set[str] = {vertex_id}
+
+        def walk(current_id: str, *, is_source: bool = False) -> None:
+            for edge in self.edges:
+                if edge.source_id != current_id:
+                    continue
+                if is_source and output_names is not None and edge.source_handle.name not in output_names:
+                    continue
+                child_id = edge.target_id
+                if child_id in visited:
+                    continue
+                visited.add(child_id)
+                walk(child_id)
+
+        walk(vertex_id, is_source=True)
+        visited.discard(vertex_id)
+        return visited
+
+    def _get_vertices_reachable_from_other_outputs(self, vertex_id: str, output_names: set[str]) -> set[str]:
+        other_output_names = self._get_output_names(vertex_id) - output_names
+        if not other_output_names:
+            return set()
+        return self._collect_branch_vertices(vertex_id, other_output_names)
+
     def _mark_branch(
-        self, vertex_id: str, state: str, visited: set | None = None, output_name: str | None = None
+        self,
+        vertex_id: str,
+        state: str,
+        visited: set | None = None,
+        output_name: str | None = None,
+        protected_vertices: set[str] | None = None,
     ) -> set:
         """Marks a branch of the graph."""
         if visited is None:
             visited = set()
         else:
+            if state == VertexStates.INACTIVE and vertex_id in (protected_vertices or set()):
+                return visited
             self.mark_vertex(vertex_id, state)
         if vertex_id in visited:
             return visited
@@ -985,11 +1165,21 @@ class Graph:
                 edge = self.get_edge(vertex_id, child_id)
                 if edge and edge.source_handle.name != output_name:
                     continue
-            self._mark_branch(child_id, state, visited)
+            self._mark_branch(child_id, state, visited, protected_vertices=protected_vertices)
         return visited
 
     def mark_branch(self, vertex_id: str, state: str, output_name: str | None = None) -> None:
-        visited = self._mark_branch(vertex_id=vertex_id, state=state, output_name=output_name)
+        protected_vertices = (
+            self._get_vertices_reachable_from_other_outputs(vertex_id, {output_name})
+            if state == VertexStates.INACTIVE and output_name
+            else None
+        )
+        visited = self._mark_branch(
+            vertex_id=vertex_id,
+            state=state,
+            output_name=output_name,
+            protected_vertices=protected_vertices,
+        )
         new_predecessor_map, _ = self.build_adjacency_maps(self.edges)
         new_predecessor_map = {k: v for k, v in new_predecessor_map.items() if k in visited}
         if vertex_id in self.cycle_vertices:
@@ -1002,6 +1192,19 @@ class Graph:
             run_predecessors=new_predecessor_map,
             vertices_to_run=self.vertices_to_run,
         )
+
+    def _replace_conditional_exclusions(self, vertex_id: str, excluded: set[str]) -> None:
+        """Replace ``vertex_id``'s conditional exclusions with ``excluded``.
+
+        Any vertices this source previously excluded are cleared first so the routing
+        decision can be re-evaluated (e.g. on later cycle iterations where the condition
+        may change) before the new set is applied and recorded against the source.
+        """
+        if vertex_id in self.conditional_exclusion_sources:
+            self.conditionally_excluded_vertices -= self.conditional_exclusion_sources.pop(vertex_id)
+        self.conditionally_excluded_vertices.update(excluded)
+        if excluded:
+            self.conditional_exclusion_sources[vertex_id] = excluded
 
     def exclude_branch_conditionally(self, vertex_id: str, output_name: str | None = None) -> None:
         """Marks a branch as conditionally excluded (for conditional routing).
@@ -1016,45 +1219,44 @@ class Graph:
 
         Args:
             vertex_id: The source vertex making the exclusion decision
-            output_name: The output name to follow when excluding downstream vertices
+            output_name: The output name to follow when excluding downstream vertices. A falsy
+                value (``None`` or an empty string) excludes the entire downstream branch
+                (every output), matching the historical behavior.
         """
-        # Clear any previous exclusions from this source vertex
-        if vertex_id in self.conditional_exclusion_sources:
-            previous_exclusions = self.conditional_exclusion_sources[vertex_id]
-            self.conditionally_excluded_vertices -= previous_exclusions
-            del self.conditional_exclusion_sources[vertex_id]
-
-        # Now exclude the new branch
-        visited: set[str] = set()
-        excluded: set[str] = set()
-        self._exclude_branch_conditionally(vertex_id, visited, excluded, output_name, skip_first=True)
-
-        # Track which vertices this source excluded
-        if excluded:
-            self.conditional_exclusion_sources[vertex_id] = excluded
-
-    def _exclude_branch_conditionally(
-        self, vertex_id: str, visited: set, excluded: set, output_name: str | None = None, *, skip_first: bool = False
-    ) -> None:
-        """Recursively excludes vertices in a branch for conditional routing."""
-        if vertex_id in visited:
+        if output_name:
+            # A single named output is the multi-branch case with one branch; delegating
+            # keeps the "keep shared downstream nodes reachable from a sibling output" logic
+            # (e.g. a merge node fed by both branches of an If-Else) in one place.
+            self.exclude_branches_conditionally(vertex_id, [output_name])
             return
-        visited.add(vertex_id)
 
-        # Don't exclude the first vertex (the router itself)
-        if not skip_first:
-            self.conditionally_excluded_vertices.add(vertex_id)
-            excluded.add(vertex_id)
+        # Whole-branch exclusion (no output filter): exclude every descendant.
+        self._replace_conditional_exclusions(vertex_id, self._collect_branch_vertices(vertex_id))
 
-        for child_id in self.parent_child_map[vertex_id]:
-            # If we're at the router (skip_first=True) and have an output_name,
-            # only follow edges from that specific output
-            if skip_first and output_name:
-                edge = self.get_edge(vertex_id, child_id)
-                if edge and edge.source_handle.name != output_name:
-                    continue
-            # After the first level, exclude all descendants
-            self._exclude_branch_conditionally(child_id, visited, excluded, output_name=None, skip_first=False)
+    def exclude_branches_conditionally(self, vertex_id: str, output_names: list[str]) -> None:
+        """Conditionally exclude several output branches of a single source vertex at once.
+
+        Behaves like :meth:`exclude_branch_conditionally` but accumulates the branches of
+        every output in ``output_names`` under one source key, so excluding one branch does
+        not clear its siblings. This is required by multi-way routers (e.g. Smart Router)
+        that keep a single matched output and must persistently exclude all the others.
+
+        Like the single-branch variant, any previous exclusions from this source vertex are
+        cleared first so the decision can be re-evaluated (e.g. on later cycle iterations).
+
+        Args:
+            vertex_id: The source vertex making the exclusion decision.
+            output_names: The output names whose downstream branches should be excluded.
+        """
+        # Exclude each requested branch, then keep shared descendants that are still
+        # reachable from a non-excluded output (for example, a merge node downstream
+        # of both a selected and an unselected branch).
+        output_names_set = set(output_names)
+        excluded: set[str] = set()
+        for output_name in output_names:
+            excluded.update(self._collect_branch_vertices(vertex_id, {output_name}))
+        excluded -= self._get_vertices_reachable_from_other_outputs(vertex_id, output_names_set)
+        self._replace_conditional_exclusions(vertex_id, excluded)
 
     def get_edge(self, source_id: str, target_id: str) -> CycleEdge | None:
         """Returns the edge between two vertices."""
@@ -1174,10 +1376,71 @@ class Graph:
         Returns:
             Graph: The created graph.
         """
+        from lfx.extension.migration import migrate_flow_payload
         from lfx.utils.flow_validation import validate_flow_for_current_settings
 
         if "data" in payload:
             payload = payload["data"]
+        # Rewrite legacy component references in place against the append-only
+        # extension migration table.  Best-effort: a corrupt table or unmapped
+        # reference produces typed errors on the report but never raises, so
+        # flow load remains as forgiving as it was pre-Phase-A.
+        migration_report = migrate_flow_payload(payload)
+        # Surface every typed error from the report through the standard
+        # logger so unmapped or ambiguous component references are not
+        # silently dropped.  We log rather than raise because the
+        # rewriter is intentionally tolerant -- a partially-broken flow
+        # still loads, and the frontend renders missing nodes as red
+        # placeholders.  The structured ``code``/``hint`` come from
+        # ``ExtensionError`` so log scrapers can parse the payload.
+        for migration_error in migration_report.errors:
+            # Use %s-style positional formatting consistent with the rest of
+            # the extension subsystem so the rendered message is readable
+            # without relying on structlog's keyword-binding behavior.
+            logger.warning(
+                "extension migration: code=%s flow_id=%s location=%s hint=%s message=%s",
+                migration_error.code,
+                flow_id,
+                migration_error.location,
+                migration_error.hint,
+                migration_error.message,
+            )
+        # Emit extension events so the frontend can surface migration results.
+        try:
+            from lfx.services.deps import get_extension_events_service
+
+            _svc = get_extension_events_service()
+            if _svc is not None:
+                # Per-user keyspace so flow_id / migration error details only
+                # reach the user that loaded the flow; fall back to "global"
+                # for unauthenticated paths (CLI, tests, single-user dev).
+                _keyspace = f"user:{user_id}" if user_id else "global"
+                if migration_report.any_rewritten:
+                    _svc.emit(
+                        "flow_migrated",
+                        {
+                            "flow_id": str(flow_id) if flow_id else None,
+                            "rewritten_count": migration_report.rewritten_count,
+                        },
+                        keyspace=_keyspace,
+                    )
+                for migration_error in migration_report.errors:
+                    _svc.emit(
+                        "extension_error",
+                        {
+                            "flow_id": str(flow_id) if flow_id else None,
+                            "code": migration_error.code,
+                            "message": migration_error.message,
+                            "hint": migration_error.hint,
+                            "location": migration_error.location,
+                        },
+                        keyspace=_keyspace,
+                    )
+        except Exception:  # noqa: BLE001 -- best-effort emit; never break flow load on an event-bus failure
+            logger.warning(
+                "extension.event_emit_failed: failed to emit migration events in from_payload.",
+                exc_info=True,
+            )
         # Defense-in-depth: validate here so that no code path can construct
         # a graph with blocked/custom components, even if an API endpoint
         # forgets its own pre-check. Ideally this would live only at the API
@@ -1441,6 +1704,8 @@ class Graph:
         files: list[str] | None = None,
         user_id: str | None = None,
         event_manager: EventManager | None = None,
+        *,
+        fallback_to_env_vars: bool = False,
     ):
         if not self._prepared:
             msg = "Graph not prepared. Call prepare() first."
@@ -1479,6 +1744,7 @@ class Graph:
             get_cache=get_cache_func,
             set_cache=set_cache_func,
             event_manager=event_manager,
+            fallback_to_env_vars=fallback_to_env_vars,
         )
 
         next_runnable_vertices = await self.get_next_runnable_vertices(
@@ -1678,7 +1944,11 @@ class Graph:
     ) -> Graph:
         """Processes the graph with vertices in each layer run in parallel."""
         has_webhook_component = "webhook" in start_component_id.lower() if start_component_id else False
-        first_layer = self.sort_vertices(start_component_id=start_component_id)
+        if self.resumed_from_checkpoint:
+            # A full re-sort would reset the restored run state and re-queue built vertices.
+            first_layer = self.resume_first_layer()
+        else:
+            first_layer = self.sort_vertices(start_component_id=start_component_id)
         vertex_task_run_count: dict[str, int] = {}
         to_process = deque(first_layer)
         layer_index = 0
@@ -1699,6 +1969,7 @@ class Graph:
         await self.initialize_run()
         lock = asyncio.Lock()
         while to_process:
+            await self.check_and_handle_pause()
             current_batch = list(to_process)  # Copy current deque items to a list
             to_process.clear()  # Clear the deque for new items
             tasks = []
@@ -2222,6 +2493,23 @@ class Graph:
         """
         return [vertex.id for vertex in self.vertices if not self.successor_map.get(vertex.id, [])]
 
+    def _orphaned_tool_vertex_ids(self) -> set[str]:
+        """Tool-mode components with no consumer, excluded from scheduling.
+
+        A tool-mode component's only output is the synthetic ``component_as_tool`` Tool, meaningful
+        only when wired into a consumer (an Agent). With no successor it is a leftover — typically a
+        tool left behind after its Agent was deleted — and building it standalone runs its underlying
+        logic with no inputs (e.g. a URL fetch with no URL), raising a ComponentBuildError that fails
+        the whole run. Skipping it keeps the rest of the flow runnable.
+        """
+        orphaned: set[str] = set()
+        for vertex in self.vertices:
+            data = getattr(vertex, "data", None)
+            node = data.get("node") if isinstance(data, dict) else None
+            if isinstance(node, dict) and node.get("tool_mode") and not self.successor_map.get(vertex.id):
+                orphaned.add(vertex.id)
+        return orphaned
+
     def sort_vertices(
         self,
         stop_component_id: str | None = None,
@@ -2244,6 +2532,15 @@ class Graph:
             get_vertex_successors=self.get_vertex_successors_ids,
             is_cyclic=self.is_cyclic,
         )
+
+        # A run that explicitly targets the tool-mode node (the node's play button sets
+        # stop/start to it) is the user inspecting its toolset output — never skip that one.
+        orphaned_tools = self._orphaned_tool_vertex_ids() - {stop_component_id, start_component_id}
+        if orphaned_tools:
+            first_layer = [vertex_id for vertex_id in first_layer if vertex_id not in orphaned_tools]
+            remaining_layers = [
+                [vertex_id for vertex_id in layer if vertex_id not in orphaned_tools] for layer in remaining_layers
+            ]
 
         self.increment_run_count()
         self._sorted_vertices_layers = [first_layer, *remaining_layers]

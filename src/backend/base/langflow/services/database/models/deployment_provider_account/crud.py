@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import col, select
 
 from langflow.services.auth import utils as auth_utils
+from langflow.services.database.models.deployment.orm_guards import ensure_provider_account_identity_immutable
 from langflow.services.database.models.deployment_provider_account.model import DeploymentProviderAccount
 from langflow.services.database.models.deployment_provider_account.schemas import DeploymentProviderKey
 from langflow.services.database.utils import normalize_string_or_none, parse_uuid
@@ -67,6 +68,28 @@ async def get_provider_account_by_id(
         DeploymentProviderAccount.id == provider_uuid,
         DeploymentProviderAccount.user_id == user_uuid,
     )
+    return (await db.exec(stmt)).first()
+
+
+async def get_provider_account_by_id_unscoped(
+    db: AsyncSession,
+    *,
+    provider_id: UUID | str,
+) -> DeploymentProviderAccount | None:
+    """Load a provider account by id without an owner scope.
+
+    Reserved for the deployment-list authz prefilter path: a caller granted READ
+    on a *shared* deployment under another user's provider account needs that
+    account's ``provider_key`` (to resolve the adapter/mapper) even though they do
+    not own the account. Row-level access is still decided by the
+    ``(owner ⊕ visible)`` SQL union in ``list_deployments_synced`` plus
+    ``ensure_deployment_permission`` — this only widens which ``provider_key`` may
+    be read, never which deployment rows surface. The list response carries no
+    provider secrets (only ``provider_key`` is used). Do NOT use on owner-scoped
+    paths; prefer ``get_provider_account_by_id`` there.
+    """
+    provider_uuid = parse_uuid(provider_id, field_name="provider_id")
+    stmt = select(DeploymentProviderAccount).where(DeploymentProviderAccount.id == provider_uuid)
     return (await db.exec(stmt)).first()
 
 
@@ -209,6 +232,26 @@ async def update_provider_account(
     provider_url: str | None = None,
     api_key: str | None = None,
 ) -> DeploymentProviderAccount:
+    requested_provider_key = (
+        _coerce_provider_key(provider_key) if provider_key is not None else provider_account.provider_key
+    )
+    requested_provider_tenant_id = (
+        normalize_string_or_none(provider_tenant_id)
+        if provider_tenant_id is not _UNSET
+        else provider_account.provider_tenant_id
+    )
+    requested_provider_url = (
+        _strip_or_raise(provider_url, "provider_url") if provider_url is not None else provider_account.provider_url
+    )
+    ensure_provider_account_identity_immutable(
+        old_provider_key=provider_account.provider_key,
+        new_provider_key=requested_provider_key,
+        old_provider_tenant_id=provider_account.provider_tenant_id,
+        new_provider_tenant_id=requested_provider_tenant_id,
+        old_provider_url=provider_account.provider_url,
+        new_provider_url=requested_provider_url,
+    )
+
     if name is not None:
         provider_account.name = _strip_or_raise(name, "name")
     if provider_tenant_id is not _UNSET:

@@ -1,7 +1,7 @@
 import { cloneDeep } from "lodash";
 import { useContext, useState } from "react";
-import { useParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
+import { useParams } from "react-router-dom";
 import { usePostAddApiKey } from "@/controllers/API/queries/api-keys";
 import {
   useResetPassword,
@@ -21,6 +21,7 @@ import type {
 } from "../../../../types/components";
 import useScrollToElement from "../hooks/use-scroll-to-element";
 import GeneralPageHeaderComponent from "./components/GeneralPageHeader";
+import LanguageFormComponent from "./components/LanguageForm";
 import PasswordFormComponent from "./components/PasswordForm";
 import ProfilePictureFormComponent from "./components/ProfilePictureForm";
 
@@ -35,7 +36,7 @@ export const GeneralPage = () => {
   const setSuccessData = useAlertStore((state) => state.setSuccessData);
   const setErrorData = useAlertStore((state) => state.setErrorData);
   const { userData, setUserData } = useContext(AuthContext);
-  const { password, cnfPassword, profilePicture } = inputState;
+  const { currentPassword, password, cnfPassword, profilePicture } = inputState;
   const autoLogin = useAuthStore((state) => state.autoLogin);
 
   const { storeApiKey } = useContext(AuthContext);
@@ -55,11 +56,15 @@ export const GeneralPage = () => {
       return;
     }
 
-    if (password !== "") {
+    if (currentPassword !== "" && password !== "") {
       mutateResetPassword(
-        { user_id: userData!.id, password: { password } },
+        {
+          user_id: userData!.id,
+          password: { current_password: currentPassword, password },
+        },
         {
           onSuccess: () => {
+            handleInput({ target: { name: "currentPassword", value: "" } });
             handleInput({ target: { name: "password", value: "" } });
             handleInput({ target: { name: "cnfPassword", value: "" } });
             setSuccessData({ title: t("success.changesSaved") });
@@ -67,6 +72,7 @@ export const GeneralPage = () => {
           onError: (error) => {
             setErrorData({
               title: t("errors.saveChanges"),
+              // biome-ignore lint/suspicious/noExplicitAny: legacy
               list: [(error as any)?.response?.data?.detail],
             });
           },
@@ -91,6 +97,7 @@ export const GeneralPage = () => {
           onError: (error) => {
             setErrorData({
               title: t("errors.saveChanges"),
+              // biome-ignore lint/suspicious/noExplicitAny: legacy
               list: [(error as any)?.response?.data?.detail],
             });
           },
@@ -112,6 +119,7 @@ export const GeneralPage = () => {
     onError: (error) => {
       setErrorData({
         title: t("errors.saveApiKey"),
+        // biome-ignore lint/suspicious/noExplicitAny: legacy
         list: [(error as any)?.response?.data?.detail],
       });
       setHasApiKey(false);
@@ -138,6 +146,8 @@ export const GeneralPage = () => {
       <GeneralPageHeaderComponent />
 
       <div className="flex w-full flex-col gap-6">
+        <LanguageFormComponent />
+
         {ENABLE_PROFILE_ICONS && (
           <ProfilePictureFormComponent
             profilePicture={profilePicture}
@@ -150,6 +160,7 @@ export const GeneralPage = () => {
 
         {!autoLogin && (
           <PasswordFormComponent
+            currentPassword={currentPassword}
             password={password}
             cnfPassword={cnfPassword}
             handleInput={handleInput}

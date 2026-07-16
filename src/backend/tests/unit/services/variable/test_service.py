@@ -1,13 +1,17 @@
+import secrets
 from datetime import datetime
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from cryptography.fernet import Fernet
+from langflow.services.auth.utils import ensure_fernet_key
 from langflow.services.database.models.variable.model import VariableUpdate
 from langflow.services.deps import get_settings_service
 from langflow.services.variable.constants import CREDENTIAL_TYPE, GENERIC_TYPE
 from langflow.services.variable.service import DatabaseVariableService
 from lfx.services.settings.constants import VARIABLES_TO_GET_FROM_ENVIRONMENT
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -44,7 +48,8 @@ async def test_initialize_user_variables__create_and_update(service, session: As
     variables = await service.list_variables(user_id, session=session)
     for name in variables:
         value = await service.get_variable(user_id, name, field, session=session)
-        assert value == env_vars[name]
+        assert isinstance(value, SecretStr)
+        assert value.get_secret_value() == env_vars[name]
 
     assert all(i in variables for i in good_vars)
     assert all(i not in variables for i in bad_vars)
@@ -72,7 +77,9 @@ async def test_get_variable(service, session: AsyncSession):
 
     result = await service.get_variable(user_id, name, field, session=session)
 
-    assert result == value
+    assert isinstance(result, SecretStr)
+    assert result.get_secret_value() == value
+    assert str(result) == "**********"
 
 
 async def test_get_variable__valueerror(service, session: AsyncSession):
@@ -97,6 +104,42 @@ async def test_get_variable__typeerror(service, session: AsyncSession):
 
     assert name in str(exc.value)
     assert "purpose is to prevent the exposure of value" in str(exc.value)
+
+
+async def test_get_variable__credential_decrypt_failure(service, session: AsyncSession):
+    """Store credential under SECRET_KEY=A, resolve with SECRET_KEY=B → raises naming the variable.
+
+    Uses ensure_fernet_key (the real SECRET_KEY→Fernet derivation path) so the test exercises
+    the exact mismatch scenario described in the ticket: a key rotation or missing persisted key.
+    The test auth service (lfx stub) is a passthrough, so we patch at the auth_utils boundary.
+    """
+    secret_key_a = secrets.token_urlsafe(32)
+    secret_key_b = secrets.token_urlsafe(32)
+    fernet_a = Fernet(ensure_fernet_key(secret_key_a))
+    fernet_b = Fernet(ensure_fernet_key(secret_key_b))
+
+    user_id = uuid4()
+    name = "MY_CRED"
+
+    # Phase 1: store credential encrypted under SECRET_KEY = secret_key_a.
+    with patch(
+        "langflow.services.variable.service.auth_utils.encrypt_api_key",
+        side_effect=lambda v: fernet_a.encrypt(v.encode()).decode(),
+    ):
+        await service.create_variable(user_id, name, "secret123", type_=CREDENTIAL_TYPE, session=session)
+
+    # Phase 2: resolve with SECRET_KEY = secret_key_b (mismatched) — Fernet raises InvalidToken → "".
+    def decrypt_with_wrong_key(ciphertext: str) -> str:
+        try:
+            return fernet_b.decrypt(ciphertext.encode()).decode()
+        except Exception:
+            return ""
+
+    with (
+        patch("langflow.services.variable.service.auth_utils.decrypt_api_key", side_effect=decrypt_with_wrong_key),
+        pytest.raises(ValueError, match=r"MY_CRED.*SECRET_KEY"),
+    ):
+        await service.get_variable(user_id, name, "", session=session)
 
 
 async def test_list_variables(service, session: AsyncSession):
@@ -130,8 +173,10 @@ async def test_update_variable(service, session: AsyncSession):
     result = await service.update_variable(user_id, name, new_value, session=session)
     new_recovered = await service.get_variable(user_id, name, field, session=session)
 
-    assert old_value == old_recovered
-    assert new_value == new_recovered
+    assert isinstance(old_recovered, SecretStr)
+    assert isinstance(new_recovered, SecretStr)
+    assert old_value == old_recovered.get_secret_value()
+    assert new_value == new_recovered.get_secret_value()
     assert result.user_id == user_id
     assert result.name == name
     assert result.value != old_value
@@ -223,7 +268,8 @@ async def test_delete_variable(service, session: AsyncSession):
     with pytest.raises(ValueError, match=f"{name} variable not found."):
         await service.get_variable(user_id, name, field, session=session)
 
-    assert recovered == value
+    assert isinstance(recovered, SecretStr)
+    assert recovered.get_secret_value() == value
 
 
 async def test_delete_variable__valueerror(service, session: AsyncSession):
@@ -246,7 +292,8 @@ async def test_delete_variable_by_id(service, session: AsyncSession):
     with pytest.raises(ValueError, match=f"{name} variable not found."):
         await service.get_variable(user_id, name, field, session=session)
 
-    assert recovered == value
+    assert isinstance(recovered, SecretStr)
+    assert recovered.get_secret_value() == value
 
 
 async def test_delete_variable_by_id__valueerror(service, session: AsyncSession):
@@ -347,6 +394,67 @@ async def test_update_generic_variable_with_fernet_signature_fails(service, sess
         await service.update_variable(user_id, "TEST_VAR", "gAAAAABthis-looks-like-encrypted", session=session)
 
 
+async def test_get_all__empty_value_warns_and_skips(service, session: AsyncSession):
+    """get_all warns and skips GENERIC variables whose stored value is None or empty."""
+    user_id = uuid4()
+
+    # Create a normal generic variable, then manually blank its value to simulate a bad DB row.
+    var = await service.create_variable(user_id, "EMPTY_VAR", "initial", type_=GENERIC_TYPE, session=session)
+    var.value = ""
+    session.add(var)
+    await session.flush()
+
+    mock_logger = MagicMock()
+    mock_logger.awarning = AsyncMock()
+    with patch("langflow.services.variable.service.logger", mock_logger):
+        result = await service.get_all(user_id, session=session)
+
+    # Variable should be excluded from results.
+    assert not any(v.name == "EMPTY_VAR" for v in result)
+    # Warning must name the variable and mention empty value.
+    warning_calls = [str(c) for c in mock_logger.awarning.call_args_list]
+    assert any("EMPTY_VAR" in c for c in warning_calls)
+    assert any("no stored value" in c for c in warning_calls)
+
+
+async def test_get_all__decrypt_failure_warns_and_skips(service, session: AsyncSession):
+    """get_all warns with a key-mismatch message when decrypt returns empty for a non-empty value."""
+    user_id = uuid4()
+
+    await service.create_variable(user_id, "MY_VAR", "real_value", type_=GENERIC_TYPE, session=session)
+
+    mock_logger = MagicMock()
+    mock_logger.awarning = AsyncMock()
+    # Simulate decrypt returning "" (key mismatch) without touching the stored value.
+    with (
+        patch("langflow.services.variable.service.auth_utils.decrypt_api_key", return_value=""),
+        patch("langflow.services.variable.service.logger", mock_logger),
+    ):
+        result = await service.get_all(user_id, session=session)
+
+    # Variable should be excluded from results.
+    assert not any(v.name == "MY_VAR" for v in result)
+    # Warning must name the variable and mention SECRET_KEY.
+    warning_calls = [str(c) for c in mock_logger.awarning.call_args_list]
+    assert any("MY_VAR" in c for c in warning_calls)
+    assert any("SECRET_KEY" in c for c in warning_calls)
+
+
+async def test_get_all__healthy_generic_variable_included(service, session: AsyncSession):
+    """get_all includes GENERIC variables that decrypt successfully — no warnings emitted."""
+    user_id = uuid4()
+
+    await service.create_variable(user_id, "GOOD_VAR", "good_value", type_=GENERIC_TYPE, session=session)
+
+    mock_logger = MagicMock()
+    mock_logger.awarning = AsyncMock()
+    with patch("langflow.services.variable.service.logger", mock_logger):
+        result = await service.get_all(user_id, session=session)
+
+    assert any(v.name == "GOOD_VAR" for v in result)
+    mock_logger.awarning.assert_not_called()
+
+
 async def test_create_credential_variable_with_fernet_signature_succeeds(service, session: AsyncSession):
     """Test that CREDENTIAL variables can have values that look like Fernet tokens (they get encrypted anyway)."""
     user_id = uuid4()
@@ -364,3 +472,70 @@ async def test_create_credential_variable_with_fernet_signature_succeeds(service
     assert variable.name == "TEST_CRED"
     # The value should be encrypted (different from input)
     assert variable.value != "gAAAAABsome-value"
+
+
+# A Fernet token always starts with this prefix. We use a synthetic one so the tests are
+# deterministic regardless of whether the auth service in the test env actually encrypts.
+_FERNET_TOKEN = "gAAAAABthis-stands-in-for-an-encrypted-credential"  # noqa: S105  # pragma: allowlist secret
+
+
+async def test_credential_to_generic_type_flip_without_value_is_rejected(service, session: AsyncSession):
+    """Security: flipping a CREDENTIAL variable to GENERIC without a new value is rejected.
+
+    Otherwise the Fernet ciphertext would remain in the row while the type says GENERIC,
+    and get_all() would decrypt it and return the plaintext secret via GET /variables.
+    """
+    user_id = uuid4()
+    variable = await service.create_variable(
+        user_id, "OPENAI_API_KEY", "placeholder", type_=CREDENTIAL_TYPE, session=session
+    )
+    saved_id = variable.model_dump()["id"]
+
+    # Pin the at-rest value to a Fernet token so the guard precondition holds in any env.
+    db_var = await service.get_variable_by_id(user_id, saved_id, session=session)
+    db_var.value = _FERNET_TOKEN
+    session.add(db_var)
+    await session.flush()
+    assert db_var.updated_at is None
+
+    # Attacker sends only {id, type=Generic} with no value -> must be rejected.
+    flip = VariableUpdate(id=saved_id, type=GENERIC_TYPE)
+    with pytest.raises(ValueError, match="without providing a new value"):
+        await service.update_variable_fields(
+            user_id=user_id,
+            variable_id=saved_id,
+            variable=flip,
+            session=session,
+        )
+
+    # The row must remain CREDENTIAL-typed (transition rejected, not silently applied).
+    db_var_after = await service.get_variable_by_id(user_id, saved_id, session=session)
+    assert db_var_after.type == CREDENTIAL_TYPE
+    assert db_var_after.updated_at is None
+
+
+async def test_get_all_never_returns_decrypted_credential_as_generic(service, session: AsyncSession):
+    """Security defense-in-depth: a GENERIC row holding a Fernet token is never decrypted/returned.
+
+    Simulates a pre-existing type-confused row (e.g. from before the write-path guard) and
+    verifies get_all() does not leak its value.
+    """
+    user_id = uuid4()
+    variable = await service.create_variable(
+        user_id, "AWS_SECRET_ACCESS_KEY", "placeholder", type_=CREDENTIAL_TYPE, session=session
+    )
+    saved_id = variable.model_dump()["id"]
+
+    # Force the corrupt state directly in the DB (bypassing the write-path guard):
+    # GENERIC type but the value is still a Fernet token.
+    db_var = await service.get_variable_by_id(user_id, saved_id, session=session)
+    db_var.type = GENERIC_TYPE
+    db_var.value = _FERNET_TOKEN
+    session.add(db_var)
+    await session.flush()
+
+    results = await service.get_all(user_id, session=session)
+    # The type-confused row must be skipped, never returned with a value derived from the token.
+    leaked = [v for v in results if v.value and v.value.startswith("gAAAAA")]
+    assert leaked == []
+    assert all(v.id != saved_id for v in results if v.value is not None)

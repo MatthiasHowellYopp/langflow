@@ -3,8 +3,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import logging
 from collections.abc import AsyncIterator, Iterator
 from copy import deepcopy
+from pathlib import Path
 from textwrap import dedent
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, get_type_hints
 from uuid import UUID
@@ -25,10 +27,8 @@ from lfx.custom.tree_visitor import RequiredInputsVisitor
 from lfx.exceptions.component import StreamingError
 from lfx.field_typing import Tool  # noqa: TC001
 
-# Lazy import to avoid circular dependency
-# from lfx.graph.state.model import create_state_model
-# Lazy import to avoid circular dependency
-# from lfx.graph.utils import has_chat_output
+# Lazy imports avoid circular deps: create_state_model (lfx.graph.state.model),
+# has_chat_output (lfx.graph.utils).
 from lfx.helpers.custom import format_type
 from lfx.memory import astore_message, aupdate_messages, delete_message
 from lfx.schema.artifact import get_artifact_type, post_process_raw
@@ -41,6 +41,7 @@ from lfx.serialization.serialization import serialize
 from lfx.template.field.base import UNDEFINED, Input, Output
 from lfx.template.frontend_node.custom_components import ComponentFrontendNode
 from lfx.utils.async_helpers import run_until_complete
+from lfx.utils.secrets import is_secret_value, unwrap_secret_value
 from lfx.utils.util import find_closest_match
 
 from .custom_component import CustomComponent
@@ -56,6 +57,8 @@ if TYPE_CHECKING:
     from lfx.schema.dataframe import DataFrame
     from lfx.schema.log import LoggableType
 
+
+logger = logging.getLogger(__name__)
 
 _ComponentToolkit = None
 
@@ -73,6 +76,36 @@ BACKWARDS_COMPATIBLE_ATTRIBUTES = ["user_id", "vertex", "tracing_service"]
 CONFIG_ATTRIBUTES = ["_display_name", "_description", "_icon", "_name", "_metadata"]
 
 
+def _wrap_if_secret(input_obj: Any, value: Any) -> Any:
+    """Return the runtime value for an input, preserving string compatibility.
+
+    Credential variables arrive as SecretStr and non-password inputs reject them
+    during validation. Password inputs keep their runtime string contract, so
+    existing component code can pass self.api_key to provider clients without
+    unwrapping every call site.
+    """
+    if input_obj is not None and getattr(input_obj, "password", False):
+        return unwrap_secret_value(value)
+    return value
+
+
+def _mask_secret_value(value: Any) -> Any:
+    if is_secret_value(value):
+        return str(value)
+    return value
+
+
+def _get_secret_text(input_obj: Any, value: Any) -> str | None:
+    if input_obj is None or not getattr(input_obj, "password", False):
+        return None
+    value = unwrap_secret_value(value)
+    return value if isinstance(value, str) and value else None
+
+
+def _copy_component_template(items: list[Any]) -> list[Any]:
+    return [item.model_copy(deep=True) if isinstance(item, BaseModel) else deepcopy(item) for item in items]
+
+
 class PlaceholderGraph(NamedTuple):
     """A placeholder graph structure for components, providing backwards compatibility.
 
@@ -85,6 +118,7 @@ class PlaceholderGraph(NamedTuple):
         flow_id (str | None): Unique identifier for the flow, if applicable.
         user_id (str | None): Identifier of the user associated with the flow, if any.
         session_id (str | None): Identifier for the current session, if applicable.
+        run_id (str | None): Identifier for the current graph run, if applicable.
         context (dict): Additional contextual information for the component's execution.
         flow_name (str | None): Name of the flow, if available.
     """
@@ -92,6 +126,7 @@ class PlaceholderGraph(NamedTuple):
     flow_id: str | None
     user_id: str | None
     session_id: str | None
+    run_id: str | None
     context: dict
     flow_name: str | None
 
@@ -117,6 +152,9 @@ class Component(CustomComponent):
     code_class_base_inheritance: ClassVar[str] = "Component"
 
     def __init__(self, **kwargs) -> None:
+        self.inputs = _copy_component_template(getattr(self.__class__, "inputs", []))
+        self.outputs = _copy_component_template(getattr(self.__class__, "outputs", []))
+
         # Initialize instance-specific attributes first
         if overlap := self._there_is_overlap_in_inputs_and_outputs():
             msg = f"Inputs and outputs have overlapping names: {overlap}"
@@ -133,6 +171,7 @@ class Component(CustomComponent):
         self._outputs_map: dict[str, Output] = {}
         self._results: dict[str, Any] = {}
         self._attributes: dict[str, Any] = {}
+        self._secret_values: set[str] = set()
         self._edges: list[EdgeData] = []
         self._components: list[Component] = []
         self._event_manager: EventManager | None = None
@@ -387,17 +426,44 @@ class Component(CustomComponent):
     def __deepcopy__(self, memo: dict) -> Component:
         if id(self) in memo:
             return memo[id(self)]
-        # Shallow-copy config/inputs: they may contain non-picklable services
-        # (e.g. _tracing_service holds ServiceManager with threading.RLock).
-        # use the mangled names to access the private attributes
+        # Shallow-copy config/inputs (mangled names) — they may hold non-picklable services
+        # (e.g. _tracing_service's ServiceManager with a threading.RLock).
         config = getattr(self, "_Component__config", {})
         inputs_raw = getattr(self, "_Component__inputs", {})
 
         kwargs = dict(config)
-        kwargs["inputs"] = dict(inputs_raw)
+        kwargs.update(inputs_raw)
         new_component = type(self)(**kwargs)
+        # Register in memo before the recursive deepcopy calls so reference cycles
+        # (e.g. components linked through _components) resolve to this same copy.
+        memo[id(self)] = new_component
         new_component._code = self._code
-        new_component._outputs_map = self._outputs_map
+        # Deep-copy so each graph_copy has independent Output objects; a shallow copy
+        # shares cached output.value across concurrent requests (first result leaks to all).
+        try:
+            new_component._outputs_map = deepcopy(self._outputs_map, memo)
+        except Exception:  # noqa: BLE001
+            # Why: an output.value can hold a non-deepcopyable object (e.g. a Langfuse
+            # handler whose __new__ needs kw-only args); without this every tool call fails.
+            logger.warning(
+                "deepcopy failed for _outputs_map on %s — falling back to per-output safe copy",
+                type(self).__name__,
+                exc_info=True,
+            )
+            new_outputs_map = {}
+            for k, output in self._outputs_map.items():
+                # Fresh memo per output: the failed outer deepcopy poisoned the shared memo with a
+                # partial copy of output.__dict__, so reusing it would return an Output missing ``value``.
+                try:
+                    copied = deepcopy(output)
+                except Exception:  # noqa: BLE001
+                    copied = output.model_copy()
+                    try:
+                        copied.value = deepcopy(output.value)
+                    except Exception:  # noqa: BLE001
+                        copied.value = output.value
+                new_outputs_map[k] = copied
+            new_component._outputs_map = new_outputs_map
 
         # Safe deepcopy of inputs
         new_inputs = {}
@@ -406,24 +472,38 @@ class Component(CustomComponent):
                 # Attempt to deepcopy the entire input object
                 new_inputs[k] = deepcopy(v, memo)
             except Exception:  # noqa: BLE001
-                # If deepcopy fails (e.g. due to RLock), handle the value carefully
-                # Pydantic's model_copy(deep=False) creates a shallow copy
+                # If deepcopy fails (e.g. due to RLock), handle the value carefully.
+                # Pydantic's model_copy(deep=False) creates a shallow copy.
+                logger.warning(
+                    "deepcopy failed for input '%s' on %s — falling back to shallow copy",
+                    k,
+                    type(self).__name__,
+                    exc_info=True,
+                )
                 input_copy = v.model_copy()
                 try:
                     input_copy.value = deepcopy(v.value, memo)
                 except Exception:  # noqa: BLE001
-                    # Keep the original value (shallow copy) if it can't be deepcopied
+                    # Keep the original value (shallow copy) if it can't be deepcopied.
+                    # WARNING: this shares a mutable reference between original and copy.
+                    logger.warning(
+                        "deepcopy failed for input '%s'.value on %s — sharing mutable reference",
+                        k,
+                        type(self).__name__,
+                        exc_info=True,
+                    )
                     input_copy.value = v.value
                 new_inputs[k] = input_copy
 
         new_component._inputs = new_inputs
-        new_component._edges = self._edges
-        new_component._components = self._components
+        # Deep-copy so each graph_copy has independent component instances; shallow copies
+        # shared intermediate components (e.g. the LLM node) and crossed concurrent responses.
+        new_component._edges = deepcopy(self._edges, memo)
+        new_component._components = deepcopy(self._components, memo)
         new_component._parameters = dict(self._parameters)
         new_component._attributes = dict(self._attributes)
         new_component._output_logs = self._output_logs
         new_component._logs = self._logs  # type: ignore[attr-defined]
-        memo[id(self)] = new_component
         return new_component
 
     def set_class_code(self) -> None:
@@ -433,10 +513,15 @@ class Component(CustomComponent):
         try:
             module = inspect.getmodule(self.__class__)
             if module is None:
-                msg = "Could not find module for class"
-                raise ValueError(msg)
-
-            class_code = inspect.getsource(module)
+                # Fallback when ``inspect.getmodule`` returns None (swapped/dropped
+                # ``sys.modules`` key, e.g. mid-reload): read the class file directly.
+                try:
+                    class_code = Path(inspect.getfile(self.__class__)).read_text(encoding="utf-8")
+                except (OSError, TypeError) as inner:
+                    msg = f"Could not find module for class {self.__class__.__name__!r}"
+                    raise ValueError(msg) from inner
+            else:
+                class_code = inspect.getsource(module)
             self._code = class_code
         except (OSError, TypeError) as e:
             msg = f"Could not find source code for {self.__class__.__name__}"
@@ -888,6 +973,14 @@ class Component(CustomComponent):
         except KeyError:
             input_ = self._get_fallback_input(name=key, display_name=key)
             self._inputs[key] = input_
+            # ``self.inputs`` resolves to the class attribute when the instance
+            # has not shadowed it yet. Appending in that case mutates the
+            # class-level list and leaks fallback values (e.g. a live LLM
+            # client) into every future instance — which then crashes during
+            # ``map_inputs`` deepcopy on the next ``Component()``. Promote to
+            # an instance-local copy before mutating.
+            if "inputs" not in self.__dict__:
+                self.inputs = list(self.inputs) if self.inputs else []
             self.inputs.append(input_)
             return input_
 
@@ -926,7 +1019,10 @@ class Component(CustomComponent):
             raise TypeError(msg)
         self.set_input_value(key, value)
         self._parameters[key] = value
-        self._attributes[key] = value
+        input_obj = self._inputs.get(key)
+        if secret_text := _get_secret_text(input_obj, value):
+            self._secret_values.add(secret_text)
+        self._attributes[key] = _wrap_if_secret(input_obj, value)
 
     def __call__(self, **kwargs):
         self.set(**kwargs)
@@ -963,8 +1059,14 @@ class Component(CustomComponent):
             user_id = self._user_id if hasattr(self, "_user_id") else None
             flow_name = self._flow_name if hasattr(self, "_flow_name") else None
             flow_id = self._flow_id if hasattr(self, "_flow_id") else None
+            run_id = self._run_id if hasattr(self, "_run_id") else None
             return PlaceholderGraph(
-                flow_id=flow_id, user_id=str(user_id), session_id=session_id, context={}, flow_name=flow_name
+                flow_id=flow_id,
+                user_id=str(user_id),
+                session_id=session_id,
+                run_id=run_id,
+                context={},
+                flow_name=flow_name,
             )
         msg = f"Attribute {name} not found in {self.__class__.__name__}"
         raise AttributeError(msg)
@@ -1005,11 +1107,17 @@ class Component(CustomComponent):
     def _map_parameters_on_frontend_node(self, frontend_node: ComponentFrontendNode) -> None:
         for name, value in self._parameters.items():
             frontend_node.set_field_value_in_template(name, value)
+            input_obj = self._inputs.get(name)
+            if input_obj is not None and hasattr(input_obj, "load_from_db"):
+                frontend_node.set_field_load_from_db_in_template(name, bool(input_obj.load_from_db))
 
     def _map_parameters_on_template(self, template: dict) -> None:
         for name, value in self._parameters.items():
             try:
                 template[name]["value"] = value
+                input_obj = self._inputs.get(name)
+                if input_obj is not None and "load_from_db" in template[name] and hasattr(input_obj, "load_from_db"):
+                    template[name]["load_from_db"] = bool(input_obj.load_from_db)
             except KeyError as e:
                 close_match = find_closest_match(name, list(template.keys()))
                 if close_match:
@@ -1118,10 +1226,15 @@ class Component(CustomComponent):
                     f"that is a reserved word and cannot be used."
                 )
                 raise ValueError(msg)
-            attributes[key] = value
+            input_obj = self._inputs.get(key)
+            if secret_text := _get_secret_text(input_obj, value):
+                self._secret_values.add(secret_text)
+            attributes[key] = _wrap_if_secret(input_obj, value)
         for key, input_obj in self._inputs.items():
             if key not in attributes and key not in self._attributes:
-                attributes[key] = input_obj.value or None
+                if secret_text := _get_secret_text(input_obj, input_obj.value):
+                    self._secret_values.add(secret_text)
+                attributes[key] = _wrap_if_secret(input_obj, input_obj.value or None)
 
         self._attributes.update(attributes)
 
@@ -1285,6 +1398,7 @@ class Component(CustomComponent):
         ):
             result.set_flow_id(self._vertex.graph.flow_id)
         result = output.apply_options(result)
+        result = self._sanitize_secret_values(result)
         output.value = result
 
         return result
@@ -1315,13 +1429,44 @@ class Component(CustomComponent):
         custom_repr = self.custom_repr()
         if custom_repr is None and isinstance(result, dict | Data | str):
             custom_repr = result
+        custom_repr = self._sanitize_secret_values(custom_repr)
         if not isinstance(custom_repr, str):
             custom_repr = str(custom_repr)
 
         raw = self._process_raw_result(result)
+        raw = self._sanitize_secret_values(raw)
         artifact_type = get_artifact_type(self.status or raw, result)
         raw, artifact_type = post_process_raw(raw, artifact_type)
         return {"repr": custom_repr, "raw": raw, "type": artifact_type}
+
+    def _sanitize_secret_string(self, value: str) -> str:
+        for secret in sorted(self._secret_values, key=len, reverse=True):
+            value = value.replace(secret, "**********")
+        return value
+
+    def _sanitize_secret_values(self, value):
+        if not self._secret_values:
+            return _mask_secret_value(value)
+        value = _mask_secret_value(value)
+        if isinstance(value, str):
+            return self._sanitize_secret_string(value)
+        if isinstance(value, Message):
+            if isinstance(value.text, str):
+                value.text = self._sanitize_secret_string(value.text)
+            value.data = self._sanitize_secret_values(value.data)
+            return value
+        if isinstance(value, Data):
+            value.data = self._sanitize_secret_values(value.data)
+            if isinstance(value.default_value, str):
+                value.default_value = self._sanitize_secret_string(value.default_value)
+            return value
+        if isinstance(value, dict):
+            return {key: self._sanitize_secret_values(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize_secret_values(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._sanitize_secret_values(item) for item in value)
+        return value
 
     def _process_raw_result(self, result):
         return self.extract_data(result)
@@ -1355,6 +1500,8 @@ class Component(CustomComponent):
         self._current_output = ""
 
     def _finalize_results(self, results, artifacts):
+        self.status = self._sanitize_secret_values(self.status)
+        self.repr_value = self._sanitize_secret_values(self.repr_value)
         self._artifacts = artifacts
         self._results = results
         if self.tracing_service:
@@ -1494,6 +1641,7 @@ class Component(CustomComponent):
             "description": tool.description,
             "tags": tool.tags if hasattr(tool, "tags") and tool.tags else [tool.name],
             "status": True,  # Initialize all tools with status True
+            "approval_actions": tool.metadata.get("approval_actions") or [],  # HITL decisions per action (LE-1447)
             "display_name": tool.metadata.get("display_name", tool.name),
             "display_description": tool.metadata.get("display_description", tool.description),
             "readonly": tool.metadata.get("readonly", False),
@@ -1536,11 +1684,28 @@ class Component(CustomComponent):
                         item["status"] = any(enabled_name in [item["name"], *item["tags"]] for enabled_name in enabled)
                 self.tools_metadata = tool_data
             else:
-                # Preserve existing status values
-                existing_status = {item["name"]: item.get("status", True) for item in self.tools_metadata}
+                # Merge: preserve user-editable fields from old metadata,
+                # update code-derived fields (args) from new tool data.
+                # For description: only preserve if the user actually edited it
+                # (detected by comparing description to display_description).
+                old_by_tag = {}
+                for item in self.tools_metadata:
+                    tags = item.get("tags", [])
+                    if tags:
+                        old_by_tag[tags[0]] = item
                 for item in tool_data:
-                    item["status"] = existing_status.get(item["name"], True)
-                tool_data = self.tools_metadata
+                    tags = item.get("tags", [])
+                    old = old_by_tag.get(tags[0]) if tags else None
+                    if old:
+                        item["status"] = old.get("status", True)
+                        item["approval_actions"] = old.get("approval_actions") or []
+                        item["name"] = old.get("name", item["name"])
+                        # Preserve description only if user customized it
+                        old_desc = old.get("description", "")
+                        old_display = old.get("display_description", "")
+                        if old_desc and old_desc != old_display:
+                            item["description"] = old_desc
+                self.tools_metadata = tool_data
         else:
             # If enabled tools are set, update status based on them
             enabled = self.enabled_tools
@@ -1571,10 +1736,21 @@ class Component(CustomComponent):
         """
         if name is None:
             name = f"Log {len(self._logs) + 1}"
+        message = self._sanitize_secret_values(message)
         log = Log(message=message, type=get_artifact_type(message), name=name)
         self._logs.append(log)
         if self.tracing_service and self._vertex:
-            self.tracing_service.add_log(trace_name=self.trace_name, log=log)
+            try:
+                self.tracing_service.add_log(trace_name=self.trace_name, log=log)
+            except RuntimeError as e:
+                # No component context available (e.g., when called as a tool outside normal execution)
+                # Logs are still stored in self._logs for later retrieval
+                from lfx.log.logger import logger
+
+                logger.warning(
+                    f"Component '{self.display_name}' logging outside execution context: {e}. "
+                    "Log stored locally but not sent to tracing service."
+                )
         if self._event_manager is not None and self._current_output:
             data = log.model_dump()
             data["output"] = self._current_output
@@ -1732,9 +1908,9 @@ class Component(CustomComponent):
                 if (
                     self._should_stream_message(stored_message, message)
                     and message is not None
-                    and isinstance(message.text, AsyncIterator | Iterator)
+                    and message.text_stream is not None
                 ):
-                    complete_message, usage_data = await self._stream_message(message.text, stored_message)
+                    complete_message, usage_data = await self._stream_message(message.text_stream, stored_message)
                     stored_message.text = complete_message
                     if complete_message:
                         stored_message.properties.state = "complete"
@@ -1760,10 +1936,31 @@ class Component(CustomComponent):
 
     async def _store_message(self, message: Message) -> Message:
         flow_id: str | None = None
+        run_id: str | None = None
+        user_id: str | None = None
+        session_metadata = dict(message.session_metadata or {})
         if hasattr(self, "graph"):
             # Convert UUID to str if needed
             flow_id = str(self.graph.flow_id) if self.graph.flow_id else None
-        stored_messages = await astore_message(message, flow_id=flow_id)
+            graph_run_id = str(self.graph.run_id) if self.graph.run_id else None
+            run_id = graph_run_id
+            # Stamp the executing user so chat-history retrieval can be scoped to its owner,
+            # closing cross-user disclosure via session_id collision. PlaceholderGraph stores
+            # user_id as ``str(...)``, so guard against the literal "None".
+            graph_user_id = self.graph.user_id
+            user_id = str(graph_user_id) if graph_user_id and str(graph_user_id) != "None" else None
+            if self.tracing_service:
+                langfuse_tracer = self.tracing_service.get_tracer("langfuse")
+                langfuse_trace_id = getattr(langfuse_tracer, "langfuse_trace_id", None)
+                if langfuse_trace_id:
+                    session_metadata["langfuse_trace_id"] = langfuse_trace_id
+                if graph_run_id:
+                    session_metadata["graph_run_id"] = graph_run_id
+        if session_metadata:
+            message.session_metadata = session_metadata
+        if run_id and not getattr(message, "run_id", None):
+            message.run_id = run_id
+        stored_messages = await astore_message(message, flow_id=flow_id, run_id=run_id, user_id=user_id)
         if len(stored_messages) != 1:
             msg = "Only one message can be stored at a time."
             raise ValueError(msg)
@@ -1806,7 +2003,7 @@ class Component(CustomComponent):
             hasattr(self, "_event_manager")
             and self._event_manager
             and stored_message.has_id()
-            and not isinstance(original_message.text, str)
+            and original_message.text_stream is not None
         )
 
     async def _update_stored_message(self, message: Message) -> Message:
@@ -1883,8 +2080,9 @@ class Component(CustomComponent):
         if self._event_manager:
             if first_chunk:
                 # Send the initial message only on the first chunk
-                msg_copy = message.model_copy()
+                msg_copy = message.model_copy(update={"properties": message.properties.model_copy(deep=True)})
                 msg_copy.text = complete_message
+                msg_copy.properties.state = "partial"
                 await self._send_message_event(msg_copy, id_=message_id)
             await asyncio.to_thread(
                 self._event_manager.on_token,

@@ -24,6 +24,10 @@ export default function ShortcutsPage() {
       flex: 1,
       editable: false,
       resizable: false,
+      valueFormatter: (params) =>
+        t(`shortcuts.name.${toCamelCase(params.data.name)}`, {
+          defaultValue: params.value,
+        }),
     }, //This column will be twice as wide as the others
     {
       headerName: t("shortcuts.columnKeyboardShortcut"),
@@ -55,6 +59,11 @@ export default function ShortcutsPage() {
       updateUniqueShortcut(fixedName, shortcut);
     });
     localStorage.removeItem("langflow-shortcuts");
+  }
+
+  function openShortcutEditor(shortcutName: string) {
+    setSelectedRows([shortcutName]);
+    setOpen(true);
   }
 
   return (
@@ -113,8 +122,15 @@ export default function ShortcutsPage() {
               columnDefs={colDefs}
               rowData={nodesRowData}
               onCellDoubleClicked={(e) => {
-                setSelectedRows([e.data.name]);
-                setOpen(true);
+                openShortcutEditor(e.data.name);
+              }}
+              onCellKeyDown={(e) => {
+                const event = e.event as KeyboardEvent | undefined;
+                if (event?.key !== "Enter" && event?.key !== " ") {
+                  return;
+                }
+                event.preventDefault();
+                openShortcutEditor(e.data.name);
               }}
             />
           )}

@@ -366,6 +366,19 @@ async def test_enabled_providers_reflects_models_endpoint(client: AsyncClient, o
 
 
 @pytest.mark.usefixtures("active_user")
+async def test_cannot_enable_deprecated_model(client: AsyncClient, logged_in_headers):
+    """Deprecated models cannot be persisted as explicitly enabled."""
+    response = await client.post(
+        "api/v1/models/enabled_models",
+        json=[{"provider": "OpenAI", "model_id": "gpt-3.5-turbo", "enabled": True}],
+        headers=logged_in_headers,
+    )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    assert response.json()["detail"] == "Cannot enable deprecated model: gpt-3.5-turbo"
+
+
+@pytest.mark.usefixtures("active_user")
 async def test_security_credential_value_never_exposed_in_variables_endpoint(
     client: AsyncClient, openai_credential, logged_in_headers
 ):
@@ -534,6 +547,53 @@ async def test_list_models_returns_live_ollama_models_when_configured(client: As
     assert set(model_names) == {"llama3.2", "mistral"}
     assert len(model_names) == 2
     assert ollama_provider["num_models"] == 2
+
+
+@pytest.mark.usefixtures("active_user")
+async def test_list_models_marks_live_only_provider_enabled(client: AsyncClient, logged_in_headers):
+    """A configured live-only provider with a fully-deprecated static catalog stays enabled.
+
+    IBM WatsonX must still report is_enabled=True from /models. WatsonX never appears in the
+    non-deprecated static catalog, so it is only added by replace_with_live_models. If is_enabled
+    is computed before that append, the WatsonX entry is returned without an is_enabled flag and the
+    Assistant filters it out, showing "No Model Provider Configured" (GitHub #13735).
+    """
+    live_watsonx_models = [
+        {"name": "ibm/granite-4-h-small", "icon": "IBM", "tool_calling": True, "default": True},
+        {"name": "meta-llama/llama-3-3-70b-instruct", "icon": "IBM", "tool_calling": True, "default": True},
+    ]
+
+    async def mock_get_enabled_providers(*_args, **_kwargs):
+        return {
+            "enabled_providers": ["IBM WatsonX"],
+            "provider_status": {"IBM WatsonX": True},
+        }
+
+    def mock_get_live_models(_user_id, provider, model_type="llm"):
+        if provider == "IBM WatsonX" and model_type == "llm":
+            return live_watsonx_models
+        return []
+
+    with (
+        mock.patch(
+            "langflow.api.v1.models.get_enabled_providers",
+            side_effect=mock_get_enabled_providers,
+        ),
+        mock.patch(
+            "lfx.base.models.model_utils.get_live_models_for_provider",
+            side_effect=mock_get_live_models,
+        ),
+    ):
+        response = await client.get("api/v1/models", headers=logged_in_headers)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    watsonx_provider = next((p for p in data if p.get("provider") == "IBM WatsonX"), None)
+    assert watsonx_provider is not None, "WatsonX should be present via live-model append"
+    model_names = [m["model_name"] for m in watsonx_provider["models"]]
+    assert set(model_names) == {"ibm/granite-4-h-small", "meta-llama/llama-3-3-70b-instruct"}
+    assert watsonx_provider.get("is_enabled") is True
+    assert watsonx_provider.get("is_configured") is True
 
 
 @pytest.mark.usefixtures("active_user")

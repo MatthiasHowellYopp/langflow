@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json as _json
+import re
 from datetime import timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from fastapi import Depends, HTTPException, Path, Query
 from fastapi_pagination import Params
@@ -23,6 +26,25 @@ if TYPE_CHECKING:
 
 
 API_WORDS = ["api", "key", "token"]
+
+_SECRET_NAME_PARTS = frozenset({"credential", "credentials", "passwd", "password", "secret"})
+_SECRET_COMPOUND_NAMES = frozenset(
+    {
+        "access_key",
+        "api_key",
+        "apikey",
+        "authorization",
+        "client_secret",
+        "connection_string",
+        "cookie",
+        "database_uri",
+        "database_url",
+        "dsn",
+        "private_key",
+        "proxy_authorization",
+        "set_cookie",
+    }
+)
 
 MAX_PAGE_SIZE = 50
 MIN_PAGE_SIZE = 1
@@ -98,6 +120,134 @@ def remove_api_keys(flow: dict):
                 value["value"] = None
 
     return flow
+
+
+def strip_secret_field_values(flow_data: dict | None) -> dict | None:
+    """Return a deep copy of ``flow_data`` with every secret field value removed.
+
+    Unlike :func:`remove_api_keys` (which only nulls password fields whose name
+    looks like an API key), this nulls the value of *every* template field marked
+    ``password`` regardless of its name. It is meant for exposing a flow to
+    unauthenticated callers (e.g. ``GET /flows/public_flow/{id}``), where any
+    stored secret — API key, token, password, connection string — must not leak.
+
+    ``flow_data`` is the flow's ``data`` mapping (``{"nodes": [...], ...}``). The
+    input is not mutated: a deep copy is returned so the caller never persists the
+    nulled values back onto the ORM object.
+
+    This function recursively processes group nodes, which contain nested flows at
+    ``node.data.node.flow.data.nodes[...]``, ensuring secrets are stripped at all
+    nesting levels.
+    """
+    if not flow_data:
+        return flow_data
+
+    scrubbed = copy.deepcopy(flow_data)
+    _strip_secrets_from_nodes(scrubbed.get("nodes", []))
+    return scrubbed
+
+
+def _normalized_secret_name(value: object) -> str:
+    """Normalize snake/kebab/camel-case names for secret-name classification."""
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value or ""))
+    return re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+
+
+def _is_secret_name(value: object) -> bool:
+    normalized = _normalized_secret_name(value)
+    if normalized in _SECRET_COMPOUND_NAMES:
+        return True
+    parts = set(normalized.split("_"))
+    is_token_value = normalized == "token" or normalized.endswith("_token")
+    return bool(parts & _SECRET_NAME_PARTS) or is_token_value or {"api", "key"}.issubset(parts)
+
+
+def _contains_url_credentials(value: str) -> bool:
+    """Return whether a URL reference contains userinfo or secret-named parameters."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return True
+    return any(
+        _is_secret_name(key)
+        for component in (parsed.query, parsed.fragment)
+        for key, _ in parse_qsl(component, keep_blank_values=True)
+    )
+
+
+def _strip_structured_secret_values(value: object) -> object:
+    """Recursively null secret-named values in dict/list component inputs."""
+    if isinstance(value, dict):
+        scrubbed = copy.deepcopy(value)
+        # Key/value inputs use ``key``; other integrations commonly serialize the same pair
+        # with ``name`` or ``header``. Treat all three as secret-name discriminators.
+        discriminator = next(
+            (scrubbed.get(key) for key in ("key", "name", "header") if _is_secret_name(scrubbed.get(key))),
+            None,
+        )
+        if discriminator is not None and "value" in scrubbed:
+            scrubbed["value"] = None
+        for key, nested_value in scrubbed.items():
+            if key == "value" and discriminator is not None:
+                continue
+            scrubbed[key] = None if _is_secret_name(key) else _strip_structured_secret_values(nested_value)
+        return scrubbed
+    if isinstance(value, list):
+        return [_strip_structured_secret_values(item) for item in value]
+    if isinstance(value, str) and _contains_url_credentials(value):
+        return None
+    return value
+
+
+def _strip_template_field_value(field: dict) -> None:
+    """Strip a template field according to its secret metadata and value shape."""
+    if field.get("password") or _is_secret_name(field.get("name")):
+        field["value"] = None
+        return
+
+    field_type = str(field.get("type") or "").lower()
+    input_type = str(field.get("_input_type") or "").lower()
+    if field_type == "mcp" or input_type == "mcpinput":
+        # The server name is safe and needed to render the public flow; embedded config is not.
+        value = field.get("value")
+        name = value.get("name") if isinstance(value, dict) else None
+        field["value"] = {"name": name} if name else None
+        return
+
+    field["value"] = _strip_structured_secret_values(field.get("value"))
+
+
+def _strip_secrets_from_nodes(nodes: list) -> None:
+    """Recursively strip secret field values from a list of nodes.
+
+    This helper processes both regular nodes and group nodes (which contain nested
+    flows). Group nodes have their nested flows recursively processed to ensure
+    secrets are stripped at all nesting levels.
+
+    Args:
+        nodes: A list of node dictionaries to process in-place.
+    """
+    for node in nodes:
+        if isinstance(node, dict):
+            node_data = node.get("data")
+            if isinstance(node_data, dict):
+                node_inner = node_data.get("node")
+                if isinstance(node_inner, dict):
+                    template = node_inner.get("template")
+                    if isinstance(template, dict):
+                        for value in template.values():
+                            if isinstance(value, dict):
+                                _strip_template_field_value(value)
+
+                    flow = node_inner.get("flow")
+                    if isinstance(flow, dict):
+                        flow_data = flow.get("data")
+                        if isinstance(flow_data, dict):
+                            nested_nodes = flow_data.get("nodes")
+                            if isinstance(nested_nodes, list):
+                                _strip_secrets_from_nodes(nested_nodes)
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +460,18 @@ def format_syntax_error_message(exc: SyntaxError) -> str:
 
 
 def get_causing_exception(exc: BaseException) -> BaseException:
-    """Get the causing exception from an exception."""
-    if hasattr(exc, "__cause__") and exc.__cause__:
+    """Get the causing exception from an exception.
+
+    Walks the ``__cause__`` chain to the root, but stops at a bundle-shim
+    ``ModuleNotFoundError`` whose curated "components moved to ..." message is
+    raised ``from`` the raw ``No module named '<x>'`` it wraps, so the curated
+    message wins instead of unwrapping past it to the bare cause underneath.
+    """
+    # A raw import error reads "No module named '<x>'"; anything else is a
+    # curated message (e.g. a bundle shim) that should win over its cause.
+    if isinstance(exc, ModuleNotFoundError) and not str(exc).startswith("No module named"):
+        return exc
+    if getattr(exc, "__cause__", None):
         return get_causing_exception(exc.__cause__)
     return exc
 
@@ -320,9 +480,14 @@ def format_exception_message(exc: Exception) -> str:
     """Format an exception message for returning to the frontend."""
     # We need to check if the __cause__ is a SyntaxError
     # If it is, we need to return the message of the SyntaxError
+    from lfx.utils.exceptions import module_not_found_hint
+
     causing_exception = get_causing_exception(exc)
     if isinstance(causing_exception, SyntaxError):
         return format_syntax_error_message(causing_exception)
+    hint = module_not_found_hint(causing_exception)
+    if hint is not None:
+        return hint
     return str(exc)
 
 
@@ -398,19 +563,44 @@ def custom_params(
     return Params(page=page or MIN_PAGE_SIZE, size=size or MAX_PAGE_SIZE)
 
 
-def extract_global_variables_from_headers(headers) -> dict[str, str]:
-    """Extract global variables from HTTP headers with prefix X-LANGFLOW-GLOBAL-VAR-*.
+# Well-known authentication headers that can be propagated to nested MCP calls
+# when ``include_auth_headers=True`` is passed. These are stored under their
+# lowercase header names so that nested server configs can reference them
+# directly, e.g. ``{"x-api-key": "x-api-key"}`` in the MCP server headers config.
+_AUTH_HEADERS_TO_PROPAGATE = frozenset({"x-api-key", "authorization"})
+
+
+def extract_global_variables_from_headers(headers, *, include_auth_headers: bool = False) -> dict[str, str]:
+    """Extract global variables from HTTP headers.
+
+    By default, only headers with the ``X-LANGFLOW-GLOBAL-VAR-*`` prefix are
+    extracted. When ``include_auth_headers=True``, the well-known authentication
+    headers ``x-api-key`` and ``authorization`` are additionally captured under
+    their lowercase names so that nested MCP server configs can reference them
+    directly (e.g. ``{"x-api-key": "x-api-key"}``).
+
+    SECURITY NOTE: Only pass ``include_auth_headers=True`` from MCP call sites
+    (see ``api/v1/mcp_projects.py``). On non-MCP routes such as ``/run`` and
+    ``/workflow``, ``x-api-key`` is Langflow's own authentication key — exposing
+    it in ``request_variables`` would make it readable by any component that
+    reads the graph context.
 
     Args:
-        headers: HTTP headers object (e.g., from FastAPI Request.headers)
+        headers: HTTP headers object (e.g., from FastAPI Request.headers).
+        include_auth_headers: When True, also extract well-known authentication
+            headers (``x-api-key``, ``authorization``) under their lowercase
+            names. Should only be set by MCP request handlers that need to
+            propagate these values to nested MCP calls.
 
     Returns:
-        Dictionary mapping variable names (uppercase) to their values
+        Dictionary mapping variable names to their values.
 
     Example:
-        headers = {"X-LANGFLOW-GLOBAL-VAR-API-KEY": "secret", "Content-Type": "application/json"}
-        result = extract_global_variables_from_headers(headers)
-        # Returns: {"API_KEY": "secret"}
+        headers = {"X-LANGFLOW-GLOBAL-VAR-API-KEY": "secret", "x-api-key": "mykey"}
+        extract_global_variables_from_headers(headers)
+        # Returns: {"API-KEY": "secret"}
+        extract_global_variables_from_headers(headers, include_auth_headers=True)
+        # Returns: {"API-KEY": "secret", "x-api-key": "mykey"}
     """
     variables: dict[str, str] = {}
 
@@ -420,6 +610,8 @@ def extract_global_variables_from_headers(headers) -> dict[str, str]:
             if header_lower.startswith(LANGFLOW_GLOBAL_VAR_HEADER_PREFIX):
                 var_name = header_lower[len(LANGFLOW_GLOBAL_VAR_HEADER_PREFIX) :].upper()
                 variables[var_name] = header_value
+            elif include_auth_headers and header_lower in _AUTH_HEADERS_TO_PROPAGATE:
+                variables[header_lower] = header_value
     except Exception as exc:  # noqa: BLE001
         # Log the error but don't raise - we want to continue execution
         logger.exception("Failed to extract global variables from headers: %s", exc)
@@ -433,3 +625,20 @@ def raise_error_if_astra_cloud_env():
         raise_error_if_astra_cloud_disable_component(disable_endpoint_in_astra_cloud_msg)
     except Exception as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
+
+
+_FORBIDDEN_HEADER_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def build_content_disposition(filename: str) -> str:
+    """Build a RFC 5987-compliant Content-Disposition header value.
+
+    Strips ASCII control chars (CR/LF/NUL/etc.) to prevent header injection,
+    then produces a dual-param header: an ASCII fallback (with backslash and
+    double-quote escaped per RFC 6266 §4.1) and a percent-encoded UTF-8 param
+    so both legacy and modern clients receive an unambiguous filename.
+    """
+    safe_filename = _FORBIDDEN_HEADER_CHARS.sub("_", filename)
+    ascii_fallback = safe_filename.encode("ascii", "replace").decode("ascii").replace("\\", "\\\\").replace('"', '\\"')
+    encoded = quote(safe_filename, safe="")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"

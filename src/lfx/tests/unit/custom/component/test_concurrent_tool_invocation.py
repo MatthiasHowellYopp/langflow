@@ -220,6 +220,28 @@ def test_should_isolate_inputs_when_input_has_non_picklable_value():
     assert product_ids == {"P1", "P2"}
 
 
+def test_deepcopy_preserves_component_reference_cycles():
+    """Component.__deepcopy__ must register itself in memo before copying _components.
+
+    A feedback loop links components through _components in a cycle (A -> B -> A).
+    If the memo entry is set only after the recursive deepcopy calls, the cycle is
+    duplicated into a second copy instead of preserved.
+    """
+    a = SlowLabelComponent(_id="a")
+    b = SlowLabelComponent(_id="b")
+    a._components = [b]
+    b._components = [a]
+
+    a_copy = deepcopy(a)
+    b_copy = a_copy._components[0]
+
+    # The cycle must round-trip back to the same copied objects.
+    assert b_copy._components[0] is a_copy
+    # And the copies must be distinct from the originals.
+    assert a_copy is not a
+    assert b_copy is not b
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -230,3 +252,30 @@ class _FakeServiceWithLock:
 
     def __init__(self):
         self._lock = threading.RLock()
+
+
+class _KwOnlyNew:
+    """Mimics a Langfuse-like object whose __new__ has required keyword-only args (not deep-copyable)."""
+
+    def __new__(cls, *, required_a, required_b):
+        instance = super().__new__(cls)
+        instance.required_a = required_a
+        instance.required_b = required_b
+        return instance
+
+
+def test_deepcopy_with_non_deepcopyable_output_value():
+    """Deepcopy must not fail when an output.value holds a non-deepcopyable object.
+
+    Regression: a Langfuse handler attached via tracing callbacks lands in an
+    output.value; its __new__ needs keyword-only args, so deepcopy of the
+    component-as-tool raised and failed every tool call. The fallback must share it.
+    """
+    component = SlowLabelComponent()
+    undeepcopyable = _KwOnlyNew(required_a=1, required_b=2)
+    component._outputs_map["result"].value = undeepcopyable
+
+    clone = deepcopy(component)
+
+    assert clone is not component
+    assert clone._outputs_map["result"].value is undeepcopyable

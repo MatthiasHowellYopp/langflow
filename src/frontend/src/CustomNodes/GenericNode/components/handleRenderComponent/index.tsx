@@ -1,9 +1,16 @@
 import { type Connection, Handle, Position } from "@xyflow/react";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { useIsFlowReadOnly } from "@/contexts/permissionsContext";
 import { useDarkStore } from "@/stores/darkStore";
 import useFlowStore from "@/stores/flowStore";
-import type { NodeDataType } from "@/types/flow";
+import type { APIDataType } from "@/types/api";
+import type { groupedObjType } from "@/types/components";
+import type {
+  NodeDataType,
+  sourceHandleType,
+  targetHandleType,
+} from "@/types/flow";
 import { nodeColorsName } from "@/utils/styleUtils";
 import ShadTooltip from "../../../../components/common/shadTooltipComponent";
 import {
@@ -171,12 +178,12 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
 }: {
   left: boolean;
   tooltipTitle?: string;
-  proxy?: any;
-  id: any;
+  proxy?: { field: string; id: string };
+  id?: targetHandleType | sourceHandleType;
   title: string;
-  myData: any;
+  myData: APIDataType;
   colors: string[];
-  setFilterEdge: (edges: any) => void;
+  setFilterEdge: (newState: groupedObjType[]) => void;
   showNode: boolean;
   testIdComplement?: string;
   nodeId: string;
@@ -185,9 +192,14 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
   const [isHovered, setIsHovered] = useState(false);
   const [openTooltip, setOpenTooltip] = useState(false);
 
-  const isLocked = useFlowStore(
+  const idType = id && "type" in id ? id.type : undefined;
+
+  const isFlowLocked = useFlowStore(
     useShallow((state) => state.currentFlow?.locked),
   );
+  const currentFlowId = useFlowStore((state) => state.currentFlow?.id);
+  const isPermissionReadOnly = useIsFlowReadOnly(currentFlowId);
+  const isLocked = isFlowLocked || isPermissionReadOnly;
 
   const edges = useFlowStore((state) => state.edges);
 
@@ -195,11 +207,11 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
   const isInConnectionMode = useFlowStore(
     useCallback(
       (state) => {
-        if (id?.type !== "model" || !left) return false;
+        if (idType !== "model" || !left) return false;
         const node = state.nodes.find((n) => n.id === nodeId);
         return (node?.data as NodeDataType)?._connectionMode === true;
       },
-      [nodeId, id?.type, left],
+      [nodeId, idType, left],
     ),
   );
 
@@ -227,7 +239,7 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
   const dark = useDarkStore((state) => state.dark);
 
   const myId = useMemo(
-    () => scapedJSONStringfy(proxy ? { ...id, proxy } : id),
+    () => scapedJSONStringfy(proxy ? { ...id, proxy } : (id ?? {})),
     [id, proxy],
   );
 
@@ -296,7 +308,7 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
 
     // Model handles that initiated connection mode on this node should not be nulled
     const isOwnModelConnectionMode =
-      id?.type === "model" && left && filterType?.target === nodeId;
+      idType === "model" && left && filterType?.target === nodeId;
 
     const isNullHandle =
       filterPresent &&
@@ -353,7 +365,7 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
           color: handleColorName,
         };
 
-    const isModelType = id?.type === "model";
+    const isModelType = idType === "model";
     const isMuted =
       isModelType && !connectedEdge && !filterPresent && !isInConnectionMode;
 
@@ -386,6 +398,7 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
 
   const handleMouseDown = useCallback(
     (event: React.MouseEvent) => {
+      if (isLocked) return;
       if (event.button === 0) {
         setHandleDragging(currentFilter);
         const handleMouseUp = () => {
@@ -395,10 +408,11 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
         document.addEventListener("mouseup", handleMouseUp);
       }
     },
-    [currentFilter, setHandleDragging],
+    [currentFilter, isLocked, setHandleDragging],
   );
 
   const handleClick = useCallback(() => {
+    if (isLocked) return;
     const nodes = useFlowStore.getState().nodes;
     setFilterEdge(groupByFamily(myData, tooltipTitle!, left, nodes!));
     setFilterType(currentFilter);
@@ -420,6 +434,7 @@ const HandleRenderComponent = memo(function HandleRenderComponent({
     filterOpenHandle,
     filterType,
     onConnect,
+    isLocked,
   ]);
 
   const handleMouseEnter = useCallback(() => setIsHovered(true), []);

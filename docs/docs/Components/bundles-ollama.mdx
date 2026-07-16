@@ -4,6 +4,9 @@ slug: /bundles-ollama
 ---
 
 import Icon from "@site/src/components/icon";
+import PartialLfxBundlesInstall from '@site/docs/_partial-bundle-lfx-bundles-install.mdx';
+
+<PartialLfxBundlesInstall />
 
 <Icon name="Blocks" aria-hidden="true" /> [**Bundles**](/components-bundle-components) contain custom components that support specific third-party integrations with Langflow.
 
@@ -27,6 +30,10 @@ To use the **Ollama** component in a flow, connect Langflow to your locally runn
 3. Once the connection is established, select a model in the **Model Name** field, such as `llama3.2:latest`.
 
     To refresh the server's list of models, click <Icon name="RefreshCw" aria-hidden="true"/> **Refresh**.
+
+    :::tip
+    Large models require significant system memory to run locally. If you see an error like `model requires more system memory than is available`, your machine does not have enough RAM to load the selected model. Try selecting a smaller model, or run Ollama on a machine with more available memory.
+    :::
 
 4. Optional: To configure additional parameters, such as temperature or max tokens, click the component to open the [component inspection panel](/concepts-components#component-menus).
 

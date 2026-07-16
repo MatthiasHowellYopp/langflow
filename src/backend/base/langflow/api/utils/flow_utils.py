@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import TYPE_CHECKING
 
@@ -10,11 +11,18 @@ from lfx.graph.graph.base import Graph
 from lfx.log.logger import logger
 from lfx.services.deps import session_scope
 from sqlalchemy import delete
+from sqlmodel import col, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from langflow.services.database.models.auth.authz import AuthzShare
+from langflow.services.database.models.deployment.exceptions import (
+    araise_if_deployment_guard_error_or_skip,
+)
+from langflow.services.database.models.deployment.guards import check_flow_has_deployed_versions
 from langflow.services.database.models.flow.model import Flow
 from langflow.services.database.models.flow_version.model import FlowVersion
 from langflow.services.database.models.message.model import MessageTable
+from langflow.services.database.models.traces.model import SpanTable, TraceTable
 from langflow.services.database.models.transactions.model import TransactionTable
 from langflow.services.database.models.user.model import User
 from langflow.services.database.models.vertex_builds.model import VertexBuildTable
@@ -52,6 +60,9 @@ async def build_graph_from_data(flow_id: uuid.UUID | str, payload: dict, **kwarg
             vertex.update_raw_params({"session_id": session_id}, overwrite=True)
 
     graph.session_id = session_id
+    # Pin the caller's run_id before initialize_run so HITL resume reuses the pre-pause trace.
+    if (caller_run_id := kwargs.get("run_id")) is not None:
+        graph.set_run_id(caller_run_id)
     await graph.initialize_run()
     return graph
 
@@ -87,6 +98,7 @@ async def build_and_cache_graph_from_data(
 
 async def cascade_delete_flow(session: AsyncSession, flow_id: uuid.UUID) -> None:
     try:
+        await check_flow_has_deployed_versions(session, flow_id=flow_id)
         # TODO: Verify if deleting messages is safe in terms of session id relevance
         # If we delete messages directly, rather than setting flow_id to null,
         # it might cause unexpected behaviors because the session id could still be
@@ -98,10 +110,65 @@ async def cascade_delete_flow(session: AsyncSession, flow_id: uuid.UUID) -> None
         # by default (requires PRAGMA foreign_keys = ON), and this function follows
         # the existing pattern of explicitly deleting all child records.
         await session.exec(delete(FlowVersion).where(FlowVersion.flow_id == flow_id))
+        # span.trace_id FK lacks ON DELETE CASCADE in the DDL, so spans must
+        # be removed before traces to avoid an FK violation under
+        # PRAGMA foreign_keys=ON.
+        trace_ids = (await session.exec(select(TraceTable.id).where(TraceTable.flow_id == flow_id))).all()
+        if trace_ids:
+            await session.exec(delete(SpanTable).where(col(SpanTable.trace_id).in_(trace_ids)))
+            await session.exec(delete(TraceTable).where(col(TraceTable.id).in_(trace_ids)))
+        # authz_share is polymorphic over resource_type/resource_id with no
+        # FK, so DB cascades cannot remove stale share rows when the flow is
+        # deleted. Clean them up here so a deleted flow's grants do not
+        # silently survive — that would let an authorization plugin keep
+        # honoring share rows that point at a tombstoned resource.
+        await session.exec(
+            delete(AuthzShare).where(AuthzShare.resource_type == "flow").where(AuthzShare.resource_id == flow_id)
+        )
         await session.exec(delete(Flow).where(Flow.id == flow_id))
     except Exception as e:
+        await araise_if_deployment_guard_error_or_skip(
+            e,
+            log_message=f"op=cascade_delete_flow flow_id={flow_id}",
+        )
         msg = f"Unable to cascade delete flow: {flow_id}"
         raise RuntimeError(msg, e) from e
+
+
+# Public flow file paths must be ``{source_flow_id}/{safe_basename}`` — uploads
+# under that namespace are the only legitimate inputs for an unauthenticated
+# build. Anything else (absolute paths, traversal, foreign flow_ids) is a
+# probe at the arbitrary-file-read class of bug (GHSA-rcjh-r59h-gq37).
+_PUBLIC_FILE_PATH_RE = re.compile(
+    r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/([^/\\]+)$"
+)
+_PUBLIC_FILE_REJECTED_SUBSTRINGS = ("\x00", "..", "\\")
+
+
+def validate_public_files(files: list[str] | None, source_flow_id: uuid.UUID) -> None:
+    """Reject file references that aren't ``{source_flow_id}/{basename}``.
+
+    Mitigates GHSA-rcjh-r59h-gq37: an unauthenticated build must not be
+    able to address files outside its own flow's storage namespace.
+    Called from any endpoint that accepts caller-supplied file references
+    under a public-access boundary.
+    """
+    if not files:
+        return
+    expected_flow_id = str(source_flow_id).lower()
+    for entry in files:
+        if not isinstance(entry, str) or not entry:
+            raise HTTPException(status_code=400, detail="Invalid file entry")
+        if any(token in entry for token in _PUBLIC_FILE_REJECTED_SUBSTRINGS):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        match = _PUBLIC_FILE_PATH_RE.match(entry)
+        if not match:
+            raise HTTPException(status_code=400, detail="Invalid file path format")
+        flow_id_segment, basename = match.group(1), match.group(2)
+        if flow_id_segment.lower() != expected_flow_id:
+            raise HTTPException(status_code=400, detail="File not in this flow's namespace")
+        if basename in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid filename")
 
 
 def compute_virtual_flow_id(identifier: str | uuid.UUID, flow_id: uuid.UUID) -> uuid.UUID:
@@ -115,6 +182,26 @@ def compute_virtual_flow_id(identifier: str | uuid.UUID, flow_id: uuid.UUID) -> 
         A deterministic UUID v5 derived from the identifier and flow_id.
     """
     return uuid.uuid5(uuid.NAMESPACE_DNS, f"{identifier}_{flow_id}")
+
+
+def scope_session_to_namespace(session: str | None, namespace: str) -> str | None:
+    """Wrap a caller-supplied session ID under a (client_id, flow_id) namespace.
+
+    Mitigates CVE-2026-33017: an unauthenticated public-flow caller cannot
+    address a session that lives outside its own namespace through a Memory
+    component, regardless of whether the caller supplies a non-empty,
+    pre-prefixed, or empty string.
+
+    Returns ``None`` unchanged. Returns the value unchanged when it equals the
+    namespace or already starts with ``f"{namespace}:"``. Otherwise prefixes
+    it -- including the empty-string case, which becomes ``f"{namespace}:"``.
+    """
+    if session is None:
+        return session
+    prefix = f"{namespace}:"
+    if session == namespace or session.startswith(prefix):
+        return session
+    return f"{prefix}{session}"
 
 
 async def verify_public_flow_and_get_user(

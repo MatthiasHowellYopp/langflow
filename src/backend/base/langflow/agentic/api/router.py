@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from lfx.base.models.unified_models import (
     get_all_variables_for_provider,
@@ -19,6 +19,7 @@ from lfx.base.models.unified_models import (
 from lfx.log.logger import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from langflow.agentic.api.deps import require_agentic_experience
 from langflow.agentic.api.schemas import AssistantRequest
 from langflow.agentic.services.assistant_service import (
     execute_flow_with_validation,
@@ -33,10 +34,11 @@ from langflow.agentic.services.provider_service import (
     PREFERRED_PROVIDERS,
     get_default_model,
     get_enabled_providers_for_user,
+    list_installed_tool_calling_models,
 )
 from langflow.api.utils.core import CurrentActiveUser, DbSession
 
-router = APIRouter(prefix="/agentic", tags=["Agentic"], include_in_schema=False)
+router = APIRouter(prefix="/agentic", tags=["Agentic"])
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,7 @@ async def _resolve_assistant_context(
     if not api_key_name:
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
 
-    model_name = request.model_name or get_default_model(provider) or ""
+    model_name = request.model_name or get_default_model(provider, user_id=user_id) or ""
 
     # Get all configured variables for the provider
     provider_vars = get_all_variables_for_provider(user_id, provider)
@@ -114,6 +116,11 @@ async def _resolve_assistant_context(
         "PROVIDER": provider,
     }
 
+    # Seeded here (not per-endpoint) so /assist and /execute/{flow_name}
+    # honor the budget the same way /assist/stream does.
+    if request.iterations_limit is not None:
+        global_vars["ITERATIONS_LIMIT"] = str(request.iterations_limit)
+
     # Inject all provider variables into the global context
     global_vars.update(provider_vars)
 
@@ -130,38 +137,60 @@ async def _resolve_assistant_context(
     )
 
 
-@router.post("/execute/{flow_name}")
-async def execute_named_flow(flow_name: str, request: AssistantRequest, current_user: CurrentActiveUser) -> dict:
-    """Execute a named flow from the flows directory."""
-    user_id = current_user.id
+async def _validate_flow_access(flow_id: str | None, user_id: UUID, session: AsyncSession) -> None:
+    """Reject an unknown or not-owned flow_id before the model is invoked.
 
-    global_vars = {
-        "USER_ID": str(user_id),
-        "FLOW_ID": request.flow_id,
-    }
+    A missing flow_id is allowed (the assistant runs with no canvas context).
+    A supplied id must reference a flow the caller can access, mirroring the
+    per-user 404 of the /run and webhook endpoints; not-found and cross-user
+    both surface 404 so a flow's existence is not leaked by id.
+    """
+    if not flow_id:
+        return
 
+    from langflow.services.database.models.flow import Flow
+
+    try:
+        flow_uuid = UUID(flow_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid flow_id: not a valid UUID.") from exc
+
+    flow = await session.get(Flow, flow_uuid)
+    if flow is None or (flow.user_id is not None and str(flow.user_id) != str(user_id)):
+        raise HTTPException(status_code=404, detail="Flow not found.")
+
+
+@router.post("/execute/{flow_name}", dependencies=[Depends(require_agentic_experience)])
+async def execute_named_flow(
+    flow_name: str,
+    request: AssistantRequest,
+    current_user: CurrentActiveUser,
+    session: DbSession,
+) -> dict:
+    """Execute a named flow from the flows directory.
+
+    Named assistant flows embed an Agent that needs provider/model/api-key
+    context. Resolving it here (instead of running the raw file) turns a
+    silent 500 into a successful run, or a clear 4xx when no provider is set.
+    """
+    ctx = await _resolve_assistant_context(request, current_user.id, session)
+
+    global_vars = dict(ctx.global_vars)
     if request.component_id:
         global_vars["COMPONENT_ID"] = request.component_id
     if request.field_name:
         global_vars["FIELD_NAME"] = request.field_name
 
-    try:
-        # Check for OpenAI variables (required for some assistant features)
-        openai_vars = get_all_variables_for_provider(user_id, "OpenAI")
-        global_vars.update(openai_vars)
-    except (ValueError, HTTPException):
-        logger.debug("OpenAI variables not configured, continuing without them")
-
-    flow_filename = f"{flow_name}.json"
-    # Generate unique session_id per request to isolate memory
-    session_id = str(uuid.uuid4())
-
     return await execute_flow_file(
-        flow_filename=flow_filename,
+        flow_filename=f"{flow_name}.json",
         input_value=request.input_value,
         global_variables=global_vars,
         verbose=True,
-        session_id=session_id,
+        user_id=str(current_user.id),
+        session_id=ctx.session_id,
+        provider=ctx.provider,
+        model_name=ctx.model_name,
+        api_key_var=ctx.api_key_name,
     )
 
 
@@ -184,11 +213,15 @@ async def check_assistant_config(
             providers=enabled_providers,
             include_unsupported=False,
             include_deprecated=False,
-            model_type="language",
+            model_type="llm",
         )
-
         for provider_dict in models_by_provider:
             provider_name = provider_dict.get("provider")
+            if not provider_name:
+                continue
+            installed = list_installed_tool_calling_models(provider_name, user_id)
+            if installed:
+                provider_dict["models"] = [{"model_name": name, "metadata": {}} for name in installed]
             models = provider_dict.get("models", [])
 
             model_list = []
@@ -209,7 +242,7 @@ async def check_assistant_config(
                     )
 
             default_model = get_default_model(provider_name)
-            if not default_model and model_list:
+            if model_list and default_model not in {m["name"] for m in model_list}:
                 default_model = model_list[0]["name"]
 
             if model_list:
@@ -249,13 +282,14 @@ async def check_assistant_config(
     }
 
 
-@router.post("/assist")
+@router.post("/assist", dependencies=[Depends(require_agentic_experience)])
 async def assist(
     request: AssistantRequest,
     current_user: CurrentActiveUser,
     session: DbSession,
 ) -> dict:
     """Chat with the Langflow Assistant."""
+    await _validate_flow_access(request.flow_id, current_user.id, session)
     ctx = await _resolve_assistant_context(request, current_user.id, session)
 
     logger.info(f"Executing {LANGFLOW_ASSISTANT_FLOW} with {ctx.provider}/{ctx.model_name}")
@@ -273,7 +307,7 @@ async def assist(
     )
 
 
-@router.post("/assist/stream")
+@router.post("/assist/stream", dependencies=[Depends(require_agentic_experience)])
 async def assist_stream(
     request: AssistantRequest,
     http_request: Request,
@@ -281,6 +315,7 @@ async def assist_stream(
     session: DbSession,
 ) -> StreamingResponse:
     """Chat with the Langflow Assistant with streaming progress updates."""
+    await _validate_flow_access(request.flow_id, current_user.id, session)
     ctx = await _resolve_assistant_context(request, current_user.id, session)
 
     return StreamingResponse(
@@ -295,6 +330,7 @@ async def assist_stream(
             model_name=ctx.model_name,
             api_key_var=ctx.api_key_name,
             is_disconnected=http_request.is_disconnected,
+            iterations_limit=request.iterations_limit,
         ),
         media_type="text/event-stream",
         headers={

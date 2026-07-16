@@ -100,7 +100,7 @@ export default function InputFileComponent({
                       onError: (error) => {
                         console.error(t("errors.uploadFile"));
                         setErrorData({
-                          title: "Error uploading file",
+                          title: t("errors.upload"),
                           list: [error.response?.data?.detail],
                         });
                       },
@@ -289,7 +289,11 @@ export default function InputFileComponent({
                             strokeWidth={ICON_STROKE_WIDTH}
                           />
                         ) : (
-                          <div>Select file{isList ? "s" : ""}</div>
+                          <div>
+                            {isList
+                              ? t("fileManager.selectFiles")
+                              : t("fileManager.selectFile")}
+                          </div>
                         )}
                       </Button>
                     </div>
@@ -312,6 +316,7 @@ export default function InputFileComponent({
                   readOnly
                   disabled={isDisabled}
                   onClick={handleButtonClick}
+                  aria-label={t("fileManager.selectFile")}
                 />
               </div>
               <div>
@@ -328,6 +333,7 @@ export default function InputFileComponent({
                   disabled={isDisabled}
                   size="icon"
                   data-testid="button_upload_file"
+                  aria-label={value ? t("files.remove") : t("files.uploadFile")}
                 >
                   <IconComponent
                     name={value ? "CircleCheckBig" : "Upload"}
